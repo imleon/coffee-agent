@@ -7,6 +7,7 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { resolve } from 'node:path'
 import { CONFIG } from './config.js'
 import { createOutputParser, type AgentEvent } from './agent-output-parser.js'
+export type { AgentEvent } from './agent-output-parser.js'
 
 export interface AgentInput {
   prompt: string
@@ -29,6 +30,14 @@ export type AgentEventHandler = (event: AgentEvent) => void
  * Spawn an Agent Runner process and stream results back via callback.
  * Returns a promise that resolves when the process exits.
  */
+function extractSessionId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+
+  const record = value as Record<string, unknown>
+  const direct = record.sessionId ?? record.session_id
+  return typeof direct === 'string' && direct.length > 0 ? direct : undefined
+}
+
 export function runAgent(
   input: AgentInput,
   onEvent: AgentEventHandler,
@@ -69,15 +78,7 @@ export function runAgent(
     // Parse stdout with marker protocol
     const parser = createOutputParser((event) => {
       events.push(event)
-
-      // Extract sessionId from result events
-      if (event.type === 'result' && typeof event.content === 'object' && event.content !== null) {
-        const content = event.content as Record<string, unknown>
-        if (content.sessionId || content.session_id) {
-          sessionId = (content.sessionId || content.session_id) as string
-        }
-      }
-
+      sessionId = extractSessionId(event) ?? extractSessionId(event.content) ?? sessionId
       onEvent(event)
     })
 

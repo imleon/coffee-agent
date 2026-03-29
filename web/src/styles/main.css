@@ -1,0 +1,18 @@
+@import 'tailwindcss';
+
+/* Markdown content styles */
+.markdown-body h1 { @apply text-2xl font-bold mb-4; }
+.markdown-body h2 { @apply text-xl font-bold mb-3; }
+.markdown-body h3 { @apply text-lg font-bold mb-2; }
+.markdown-body p { @apply mb-3 leading-relaxed; }
+.markdown-body pre { @apply bg-gray-900 text-gray-100 rounded-lg p-4 mb-3 overflow-x-auto; }
+.markdown-body code { @apply bg-gray-100 text-pink-600 px-1.5 py-0.5 rounded text-sm; }
+.markdown-body pre code { @apply bg-transparent text-inherit p-0; }
+.markdown-body ul { @apply list-disc pl-6 mb-3; }
+.markdown-body ol { @apply list-decimal pl-6 mb-3; }
+.markdown-body li { @apply mb-1; }
+.markdown-body blockquote { @apply border-l-4 border-gray-300 pl-4 italic text-gray-600 mb-3; }
+.markdown-body a { @apply text-blue-600 hover:underline; }
+.markdown-body table { @apply w-full border-collapse mb-3; }
+.markdown-body th, .markdown-body td { @apply border border-gray-300 px-3 py-2 text-left; }
+.markdown-body th { @apply bg-gray-100 font-semibold; }

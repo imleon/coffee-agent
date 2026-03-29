@@ -4,11 +4,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "postinstall": "cd agent && npm install",
+    "postinstall": "cd agent && npm install && cd ../web && npm install",
     "dev": "tsx watch src/index.ts",
+    "dev:web": "cd web && npm run dev",
     "build": "tsc -p tsconfig.json",
     "build:agent": "cd agent && npm run build",
-    "build:all": "npm run build && npm run build:agent",
+    "build:web": "cd web && npm run build",
+    "build:all": "npm run build && npm run build:agent && npm run build:web",
     "start": "node dist/index.js",
     "test:cli": "tsx src/cli-test.ts"
   },

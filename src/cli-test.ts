@@ -22,15 +22,15 @@ async function main() {
       },
       (event: AgentEvent) => {
         const c = event.content as Record<string, unknown>
-        if (c.type === 'result') {
+        if (event.type === 'result') {
           console.log('\n\n--- Result ---')
           console.log(JSON.stringify(c, null, 2))
-        } else if (typeof c.result === 'string') {
-          process.stdout.write(c.result)
-        } else if (c.type === 'system' || c.type === 'assistant') {
-          // skip verbose system/assistant meta events
+        } else if (event.type === 'assistant') {
+          // skip verbose assistant payloads in CLI test
+        } else if (event.type === 'system') {
+          // skip verbose system meta events
         } else {
-          console.log(`[${String(c.type || event.type)}]`, JSON.stringify(c).slice(0, 150))
+          console.log(`[${event.type}]`, JSON.stringify(c).slice(0, 150))
         }
       }
     )

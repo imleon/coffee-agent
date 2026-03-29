@@ -48,6 +48,14 @@ async function readStdin(): Promise<string> {
 
 // --- Main ---
 
+function extractSessionId(value: unknown): string | undefined {
+  if (!value || typeof value !== 'object') return undefined
+
+  const record = value as Record<string, unknown>
+  const direct = record.sessionId ?? record.session_id
+  return typeof direct === 'string' && direct.length > 0 ? direct : undefined
+}
+
 async function main(): Promise<void> {
   // 1. Read input
   const raw = await readStdin()
@@ -72,11 +80,9 @@ async function main(): Promise<void> {
       cwd: input.workspacePath,
       ...(input.model ? { model: input.model } : {}),
       allowedTools: [
-        'Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep',
-        'WebSearch', 'WebFetch',
-        'Task', 'TodoWrite',
+        'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
       ],
-      permissionMode: 'bypassPermissions',
+      permissionMode: 'default',
     }
 
     // Resume existing session if sessionId provided
@@ -91,6 +97,7 @@ async function main(): Promise<void> {
 
     // 3. Call SDK query() — the core loop
     let messageCount = 0
+    let sessionId = input.sessionId
     const queryIterator = query({
       prompt: input.prompt,
       options: options as any,
@@ -98,6 +105,7 @@ async function main(): Promise<void> {
 
     for await (const message of queryIterator) {
       messageCount++
+      sessionId = extractSessionId(message) ?? sessionId
       writeOutput({
         type: (message as any).type || 'message',
         content: message,
@@ -112,6 +120,7 @@ async function main(): Promise<void> {
       content: {
         status: 'completed',
         messageCount,
+        ...(sessionId ? { sessionId } : {}),
       },
     })
 
