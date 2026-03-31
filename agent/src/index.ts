@@ -6,6 +6,7 @@ import type {
   RunnerCommand,
   RunnerRuntimeEvent,
   RuntimeEnvelopeBase,
+  SdkTransportEvent,
   SessionMessage,
 } from '../../shared/message-types.js'
 import {
@@ -36,6 +37,16 @@ function writeRuntimeEvent(event: RunnerRuntimeEvent): void {
   writeOutput(event)
 }
 
+function writeTransportEvent(event: Omit<SdkTransportEvent, 'source'>): void {
+  writeRuntimeEvent({
+    type: 'sdk.transport',
+    event: {
+      source: 'sdk-transport',
+      ...event,
+    },
+  })
+}
+
 function extractSessionId(value: unknown): string | undefined {
   if (!value || typeof value !== 'object') return undefined
   const record = value as Record<string, unknown>
@@ -55,6 +66,60 @@ function createDeferred<T>() {
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' ? value as Record<string, unknown> : null
+}
+
+function summarizeValue(value: unknown): string {
+  if (value == null) return ''
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    if (!trimmed) return ''
+    return trimmed.length > 160 ? `${trimmed.slice(0, 160)}…` : trimmed
+  }
+  if (typeof value === 'number' || typeof value === 'boolean') return String(value)
+  if (Array.isArray(value)) return `array(${value.length})`
+  if (typeof value === 'object') {
+    const keys = Object.keys(value as Record<string, unknown>)
+    return keys.length > 0 ? `object(${keys.slice(0, 6).join(', ')})` : 'object(0)'
+  }
+  return String(value)
+}
+
+function shouldIncludeTransportPayload(): boolean {
+  const raw = (process.env.COTTA_DEBUG_SDK_TRANSPORT || process.env.COTTA_DEBUG || '').trim().toLowerCase()
+  if (!raw) return false
+  return raw === '1' || raw === 'true' || raw === '*' || raw.split(',').map((part) => part.trim()).includes('sdk-transport')
+}
+
+function maybeTransportPayload(payload: unknown): { payload?: unknown } {
+  return shouldIncludeTransportPayload() ? { payload } : {}
+}
+
+function summarizeSdkMessage(message: SDKMessage): string {
+  switch (message.type) {
+    case 'assistant': {
+      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
+      if (Array.isArray(message.message?.content)) return `assistant blocks=${message.message.content.length}`
+      return 'assistant message'
+    }
+    case 'user': {
+      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
+      if (Array.isArray(message.message?.content)) return `user blocks=${message.message.content.length}`
+      return 'user message'
+    }
+    case 'result':
+      return typeof message.subtype === 'string' ? `result.${message.subtype}` : 'result'
+    case 'tool_progress':
+      return typeof message.tool_name === 'string' ? `tool ${message.tool_name}` : 'tool progress'
+    case 'tool_use_summary':
+      return typeof message.summary === 'string' ? summarizeValue(message.summary) : 'tool summary'
+    case 'system':
+      return typeof message.subtype === 'string' ? `system.${message.subtype}` : 'system'
+    default: {
+      const payload = message as Record<string, unknown>
+      const subtype = typeof payload.subtype === 'string' ? `.${payload.subtype}` : ''
+      return `${message.type}${subtype}`
+    }
+  }
 }
 
 function toParsedSessionMessage(message: SDKMessage): SessionMessage | undefined {
@@ -153,6 +218,15 @@ function handleCommand(command: RunnerCommand) {
         permissionId: command.permissionId.slice(0, 8),
         decision: command.decision,
       })
+      writeTransportEvent({
+        direction: 'inbound',
+        eventName: 'control.response.permission',
+        requestId: command.permissionId,
+        toolUseId: command.permissionId,
+        payloadSummary: command.decision,
+        ...maybeTransportPayload({ decision: command.decision }),
+        ...nextEnvelope(currentSessionId),
+      })
       const resolve = permissionWaiters.get(command.permissionId)
       if (resolve) {
         permissionWaiters.delete(command.permissionId)
@@ -164,6 +238,14 @@ function handleCommand(command: RunnerCommand) {
       logAgent('info', 'agent:elicitation:response', {
         requestId: command.requestId.slice(0, 8),
         action: command.response.action,
+      })
+      writeTransportEvent({
+        direction: 'inbound',
+        eventName: 'control.response.elicitation',
+        requestId: command.requestId,
+        payloadSummary: command.response.action,
+        ...maybeTransportPayload(command.response),
+        ...nextEnvelope(currentSessionId),
       })
       const resolve = elicitationWaiters.get(command.requestId)
       if (resolve) {
@@ -179,6 +261,12 @@ function handleCommand(command: RunnerCommand) {
       cancelRequested = true
       logAgent('warn', 'agent:run:cancel', {
         sessionId: currentSessionId?.slice(0, 8),
+      })
+      writeTransportEvent({
+        direction: 'inbound',
+        eventName: 'query.cancel',
+        payloadSummary: 'cancel requested',
+        ...nextEnvelope(currentSessionId),
       })
       activeQuery?.close()
       break
@@ -247,6 +335,25 @@ async function waitForPermission(request: PermissionRequest, signal: AbortSignal
     permissionId: request.permissionId.slice(0, 8),
     toolName: request.toolName,
     sessionId: currentSessionId?.slice(0, 8),
+  })
+  writeTransportEvent({
+    direction: 'outbound',
+    eventName: 'control.request.permission',
+    requestId: request.permissionId,
+    toolUseId: request.permissionId,
+    payloadSummary: request.toolName,
+    ...maybeTransportPayload({
+      toolName: request.toolName,
+      input: request.input,
+      title: request.title,
+      displayName: request.displayName,
+      description: request.description,
+      decisionReason: request.decisionReason,
+      blockedPath: request.blockedPath,
+      agentId: request.agentId,
+      suggestions: request.permissionSuggestions,
+    }),
+    ...nextEnvelope(currentSessionId),
   })
   writeRuntimeEvent({
     type: 'sdk.control.requested',
@@ -328,6 +435,14 @@ async function waitForElicitation(request: ElicitationRequest, signal: AbortSign
     serverName: request.serverName,
     sessionId: currentSessionId?.slice(0, 8),
   })
+  writeTransportEvent({
+    direction: 'outbound',
+    eventName: 'control.request.elicitation',
+    requestId,
+    payloadSummary: request.serverName,
+    ...maybeTransportPayload(request),
+    ...nextEnvelope(currentSessionId),
+  })
   writeRuntimeEvent({
     type: 'sdk.control.requested',
     interaction,
@@ -404,6 +519,16 @@ function handleSdkMessage(message: SDKMessage) {
     })
   }
 
+  writeTransportEvent({
+    direction: 'outbound',
+    eventName: 'message',
+    sdkType: message.type,
+    sdkSubtype: 'subtype' in message && typeof message.subtype === 'string' ? message.subtype : undefined,
+    payloadSummary: summarizeSdkMessage(message),
+    ...maybeTransportPayload(message),
+    ...nextEnvelope(currentSessionId),
+  })
+
   if (message.type === 'system' && message.subtype === 'session_state_changed') {
     writeRuntimeEvent({
       type: 'run.state_changed',
@@ -475,12 +600,13 @@ async function main(): Promise<void> {
       )
     }
 
+    const allowedTools = [
+      'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
+    ]
     const options: Record<string, unknown> = {
       cwd: input.workspacePath,
       ...(input.model ? { model: input.model } : {}),
-      allowedTools: [
-        'Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch',
-      ],
+      allowedTools,
       permissionMode: 'default',
       canUseTool,
       onElicitation: waitForElicitation,
@@ -497,10 +623,23 @@ async function main(): Promise<void> {
     let messageCount = 0
     writeRuntimeEvent({ type: 'run.started', ...(currentSessionId ? { sessionId: currentSessionId } : {}) })
     writeRuntimeEvent({ type: 'run.state_changed', state: 'running', ...(currentSessionId ? { sessionId: currentSessionId } : {}) })
+    writeTransportEvent({
+      direction: 'inbound',
+      eventName: 'query.start',
+      payloadSummary: input.prompt.trim().slice(0, 160),
+      ...maybeTransportPayload({
+        prompt: input.prompt,
+        sessionId: input.sessionId,
+        systemPrompt: input.systemPrompt,
+        model: input.model,
+        allowedTools,
+      }),
+      ...nextEnvelope(currentSessionId),
+    })
     logAgent('info', 'agent:query:start', {
       sessionId: currentSessionId?.slice(0, 8),
       resume: Boolean(input.sessionId),
-      allowedTools: ['Read', 'Glob', 'Grep', 'WebSearch', 'WebFetch'],
+      allowedTools,
     })
 
     activeQuery = query({
@@ -519,6 +658,13 @@ async function main(): Promise<void> {
         messageCount,
         sessionId: currentSessionId?.slice(0, 8),
       })
+      writeTransportEvent({
+        direction: 'outbound',
+        eventName: 'query.completed',
+        payloadSummary: `messages=${messageCount}`,
+        ...maybeTransportPayload({ messageCount }),
+        ...nextEnvelope(currentSessionId),
+      })
       writeRuntimeEvent({
         type: 'run.completed',
         messageCount,
@@ -528,6 +674,13 @@ async function main(): Promise<void> {
       logAgent('warn', 'agent:query:cancelled', {
         messageCount,
         sessionId: currentSessionId?.slice(0, 8),
+      })
+      writeTransportEvent({
+        direction: 'outbound',
+        eventName: 'query.cancelled',
+        payloadSummary: `messages=${messageCount}`,
+        ...maybeTransportPayload({ messageCount }),
+        ...nextEnvelope(currentSessionId),
       })
       writeRuntimeEvent({
         type: 'run.cancelled',
@@ -540,6 +693,13 @@ async function main(): Promise<void> {
         error: error instanceof Error ? error.message : String(error),
         sessionId: currentSessionId?.slice(0, 8),
       })
+      writeTransportEvent({
+        direction: 'outbound',
+        eventName: 'query.failed',
+        payloadSummary: error instanceof Error ? error.message : String(error),
+        ...maybeTransportPayload(error instanceof Error ? { name: error.name, message: error.message, stack: error.stack } : { error: String(error) }),
+        ...nextEnvelope(currentSessionId),
+      })
       writeRuntimeEvent({
         type: 'run.failed',
         error: error instanceof Error ? error.message : String(error),
@@ -548,6 +708,12 @@ async function main(): Promise<void> {
       })
       process.exit(1)
     } else {
+      writeTransportEvent({
+        direction: 'outbound',
+        eventName: 'query.cancelled',
+        payloadSummary: 'cancelled after close',
+        ...nextEnvelope(currentSessionId),
+      })
       writeRuntimeEvent({
         type: 'run.cancelled',
         ...(currentSessionId ? { sessionId: currentSessionId } : {}),

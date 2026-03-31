@@ -7,9 +7,14 @@ import type {
   SessionMessageBlock,
   SessionRunState,
   SessionSummary,
+  SdkMessageLayer,
 } from '../../../shared/message-types.js'
 import {
-  normalizeSdkEnvelopeMessage,
+  getSdkMessageLayer,
+  isBusinessSdkMessage,
+  isRunStateSdkMessage,
+} from '../../../shared/message-types.js'
+import {
   normalizeStoredTranscriptMessage,
 } from '../../../shared/transcript-normalizer.js'
 import { createDebugLogger } from '../lib/debug.js'
@@ -27,6 +32,14 @@ export interface SdkTimelineItem {
   kind: 'sdk-message'
   key: string
   event: Extract<SessionEvent, { type: 'session.sdk.message' }>
+  timestamp: number
+}
+
+export interface RunStateSdkEventItem {
+  kind: 'run-state-event'
+  key: string
+  event: Extract<SessionEvent, { type: 'session.sdk.message' }>
+  layer: SdkMessageLayer
   timestamp: number
 }
 
@@ -88,17 +101,35 @@ export const useSessionStore = defineStore('session', () => {
   const authChecked = ref(false)
   const activeRunId = ref<string | null>(null)
   const pendingInteraction = ref<PendingInteraction | null>(null)
-  const eventLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.message' }>>> ([])
+  const eventLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.message' }>>>([])
+  const transportLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.transport' }>>>([])
 
   const isLoading = computed(() => ['queued', 'running', 'requires_action'].includes(runState.value))
   const hasAuthToken = computed(() => authToken.value.trim().length > 0)
   const isAwaitingApproval = computed(() => pendingInteraction.value?.kind === 'permission' && pendingInteraction.value?.status === 'pending')
   const isAwaitingInteraction = computed(() => pendingInteraction.value?.status === 'pending')
   const hasActiveRun = computed(() => awaitingRunStart || activeRunId.value !== null)
-  const telemetry = computed(() => eventLog.value.filter((event) => event.payload?.type !== 'assistant' && event.payload?.type !== 'user'))
+  const sdkEvents = computed(() => eventLog.value)
+  const sdkTransportEvents = computed(() => transportLog.value)
+  const telemetry = computed(() => eventLog.value.filter((event) => !isBusinessSdkMessage(event.payload)))
+  const observabilityEvents = computed(() => eventLog.value.filter((event) => {
+    if (getSdkMessageLayer(event.payload) !== 'debug-observability') return false
+    return !(event.payload?.type === 'system' && event.payload?.subtype === 'init')
+  }))
+  const runStateEvents = computed<RunStateSdkEventItem[]>(() =>
+    eventLog.value
+      .filter((event) => isRunStateSdkMessage(event.payload))
+      .map((event, index) => ({
+        kind: 'run-state-event',
+        key: `run-state-${event.sequence}-${index}`,
+        event,
+        layer: getSdkMessageLayer(event.payload),
+        timestamp: typeof event.receivedAt === 'number' ? event.receivedAt : Date.now(),
+      }))
+  )
   const liveSdkTimeline = computed<SdkTimelineItem[]>(() =>
     eventLog.value
-      .filter((event) => event.payload?.type === 'assistant' || event.payload?.type === 'user')
+      .filter((event) => isBusinessSdkMessage(event.payload))
       .map((event, index) => ({
         kind: 'sdk-message',
         key: `${event.sequence}-${index}`,
@@ -213,16 +244,30 @@ export const useSessionStore = defineStore('session', () => {
     }
   }
 
+  function applyTransportEvent(event: Extract<SessionEvent, { type: 'session.sdk.transport' }>) {
+    transportLog.value = [...transportLog.value.slice(-199), event]
+    syncSessionId(event.event.sessionId)
+    if (transportLog.value.length === 1 || transportLog.value.length % EVENT_LOG_INTERVAL === 0) {
+      logger.debug('chat:sdk-transport', {
+        count: transportLog.value.length,
+        direction: event.event.direction,
+        eventName: event.event.eventName,
+        sequence: event.event.sequence,
+        sessionId: shortId(event.event.sessionId),
+      })
+    }
+  }
+
   function applyEvent(event: SessionEvent) {
     observedEventCount += 1
-    if (observedEventCount === 1 || observedEventCount % EVENT_LOG_INTERVAL === 0 || event.type !== 'session.sdk.message') {
+    if (observedEventCount === 1 || observedEventCount % EVENT_LOG_INTERVAL === 0 || (event.type !== 'session.sdk.message' && event.type !== 'session.sdk.transport')) {
       logger.info('session:event', {
         count: observedEventCount,
         type: event.type,
         runId: 'runId' in event ? shortId(event.runId) : undefined,
-        sessionId: 'sessionId' in event ? shortId(event.sessionId) : undefined,
+        sessionId: 'sessionId' in event ? shortId(event.sessionId) : event.type === 'session.sdk.transport' ? shortId(event.event.sessionId) : undefined,
         state: 'state' in event ? event.state : undefined,
-        sequence: 'sequence' in event ? event.sequence : undefined,
+        sequence: 'sequence' in event ? event.sequence : event.type === 'session.sdk.transport' ? event.event.sequence : undefined,
       })
     }
 
@@ -290,6 +335,10 @@ export const useSessionStore = defineStore('session', () => {
 
       case 'session.sdk.message':
         applySdkMessage(event)
+        break
+
+      case 'session.sdk.transport':
+        applyTransportEvent(event)
         break
 
       case 'session.sdk.control.requested':
@@ -512,6 +561,7 @@ export const useSessionStore = defineStore('session', () => {
     currentSessionId.value = null
     historyMessages.value = []
     eventLog.value = []
+    transportLog.value = []
     observedEventCount = 0
     clearRunState('idle')
   }
@@ -523,6 +573,7 @@ export const useSessionStore = defineStore('session', () => {
     currentSessionId.value = id
     historyMessages.value = []
     eventLog.value = []
+    transportLog.value = []
     observedEventCount = 0
     clearRunState('idle')
     loadSessionMessages(id)
@@ -651,6 +702,7 @@ export const useSessionStore = defineStore('session', () => {
     historyMessages.value = []
     sessions.value = []
     eventLog.value = []
+    transportLog.value = []
     observedEventCount = 0
     clearRunState('idle')
   }
@@ -671,8 +723,13 @@ export const useSessionStore = defineStore('session', () => {
     hasActiveRun,
     activeRunId,
     pendingInteraction,
+    sdkEvents,
+    sdkTransportEvents,
     telemetry,
+    observabilityEvents,
+    runStateEvents,
     eventLog,
+    transportLog,
     isAwaitingApproval,
     isAwaitingInteraction,
     connect,

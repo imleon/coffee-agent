@@ -16,7 +16,8 @@ import {
 const session = useSessionStore()
 const container = ref<HTMLElement>()
 const elicitationInput = ref('')
-const telemetryItems = computed(() => session.telemetry.slice().reverse())
+const runStateItems = computed(() => session.runStateEvents.slice().reverse())
+const observabilityItems = computed(() => session.observabilityEvents.slice().reverse())
 const timelineItems = computed(() => session.timeline)
 const pendingInteractionTitle = computed(() => {
   const interaction = session.pendingInteraction
@@ -45,6 +46,92 @@ const pendingInteractionUrl = computed(() =>
 const pendingInteractionSchema = computed(() =>
   session.pendingInteraction?.kind === 'elicitation' ? session.pendingInteraction.requestedSchema : undefined
 )
+
+function getRunStateLabel(payload: Record<string, unknown> | null | undefined): string {
+  if (!payload || typeof payload !== 'object') return 'Run state event'
+
+  if (payload.type === 'result') {
+    const subtype = typeof payload.subtype === 'string' ? payload.subtype : 'result'
+    return subtype === 'success' ? 'Run completed' : `Run ${subtype}`
+  }
+
+  if (payload.type === 'tool_progress') {
+    const toolName = typeof payload.tool_name === 'string' ? payload.tool_name : 'unknown_tool'
+    return `Tool running · ${toolName}`
+  }
+
+  if (payload.type === 'tool_use_summary') {
+    return 'Tool summary'
+  }
+
+  if (payload.type === 'system') {
+    const subtype = typeof payload.subtype === 'string' ? payload.subtype : 'system'
+    switch (subtype) {
+      case 'session_state_changed':
+        return `Session state · ${typeof payload.state === 'string' ? payload.state : 'unknown'}`
+      case 'status':
+        return `Status · ${typeof payload.status === 'string' ? payload.status : 'unknown'}`
+      case 'task_started':
+        return 'Task started'
+      case 'task_progress':
+        return 'Task progress'
+      case 'task_notification':
+        return 'Task notification'
+      default:
+        return `System · ${subtype}`
+    }
+  }
+
+  return typeof payload.type === 'string' ? payload.type : 'Run state event'
+}
+
+function getRunStateSummary(payload: Record<string, unknown> | null | undefined): string {
+  if (!payload || typeof payload !== 'object') return ''
+
+  if (payload.type === 'result') {
+    if (typeof payload.result === 'string' && payload.result.trim()) return payload.result
+    const errors = Array.isArray(payload.errors) ? payload.errors.filter((item) => typeof item === 'string') : []
+    return errors.join('\n')
+  }
+
+  if (payload.type === 'tool_progress') {
+    const elapsed = typeof payload.elapsed_time_seconds === 'number' ? `${payload.elapsed_time_seconds}s` : ''
+    return elapsed ? `Elapsed ${elapsed}` : ''
+  }
+
+  if (payload.type === 'tool_use_summary') {
+    return typeof payload.summary === 'string' ? payload.summary : ''
+  }
+
+  if (payload.type === 'system') {
+    switch (payload.subtype) {
+      case 'task_started':
+      case 'task_progress':
+        return typeof payload.description === 'string' ? payload.description : ''
+      case 'task_notification':
+        return typeof payload.summary === 'string' ? payload.summary : ''
+      default:
+        return ''
+    }
+  }
+
+  return ''
+}
+
+function getEventMeta(item: { sequence: number; receivedAt: number }): string {
+  return `seq=${item.sequence} time=${item.receivedAt}`
+}
+
+function getEventPayload(item: { payload: unknown }): string {
+  return stringifyStructuredValue(item.payload)
+}
+
+function renderObservabilityTitle(payload: Record<string, unknown> | null | undefined): string {
+  if (!payload || typeof payload !== 'object') return 'unknown'
+  const type = typeof payload.type === 'string' ? payload.type : 'unknown'
+  const subtype = typeof payload.subtype === 'string' ? payload.subtype : ''
+  return subtype ? `${type}.${subtype}` : type
+}
 
 function renderMarkdown(content: string): string {
   const html = marked.parse(content, { async: false }) as string
@@ -112,7 +199,7 @@ function submitElicitation() {
 }
 
 watch(
-  () => [session.timeline.length, session.telemetry.length, session.pendingInteraction?.id],
+  () => [session.timeline.length, session.runStateEvents.length, session.observabilityEvents.length, session.pendingInteraction?.id],
   async () => {
     await nextTick()
     if (container.value) {
@@ -289,16 +376,35 @@ watch(
       </div>
     </div>
 
-    <div v-if="telemetryItems.length > 0" class="space-y-2">
-      <div class="text-xs font-medium uppercase tracking-wide text-gray-400">SDK event log</div>
+    <div v-if="runStateItems.length > 0" class="space-y-2">
+      <div class="text-xs font-medium uppercase tracking-wide text-emerald-500">Run state events</div>
       <div
-        v-for="(item, idx) in telemetryItems"
-        :key="`telemetry-${idx}`"
+        v-for="item in runStateItems"
+        :key="item.key"
+        class="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-900"
+      >
+        <div class="font-medium">{{ getRunStateLabel(item.event.payload as Record<string, unknown> | undefined) }}</div>
+        <div class="mt-1 text-[11px] text-emerald-700">{{ getEventMeta(item.event) }}</div>
+        <div v-if="getRunStateSummary(item.event.payload as Record<string, unknown> | undefined)" class="mt-2 whitespace-pre-wrap text-xs text-emerald-900">
+          {{ getRunStateSummary(item.event.payload as Record<string, unknown> | undefined) }}
+        </div>
+        <details class="mt-2">
+          <summary class="cursor-pointer text-[11px] text-emerald-700">Raw payload</summary>
+          <pre class="mt-2 whitespace-pre-wrap text-xs text-emerald-950">{{ getEventPayload(item.event) }}</pre>
+        </details>
+      </div>
+    </div>
+
+    <div v-if="observabilityItems.length > 0" class="space-y-2">
+      <div class="text-xs font-medium uppercase tracking-wide text-gray-400">Observability events</div>
+      <div
+        v-for="item in observabilityItems"
+        :key="`telemetry-${item.sequence}`"
         class="rounded-xl border border-gray-200 bg-gray-50 px-3 py-2 text-xs text-gray-700"
       >
-        <div class="font-medium text-gray-900">{{ item.payload?.type || 'unknown' }}</div>
-        <div class="mt-1 text-[11px] text-gray-500">seq={{ item.sequence }} time={{ item.receivedAt }}</div>
-        <pre class="mt-2 whitespace-pre-wrap">{{ stringifyStructuredValue(item.payload) }}</pre>
+        <div class="font-medium text-gray-900">{{ renderObservabilityTitle(item.payload as Record<string, unknown> | undefined) }}</div>
+        <div class="mt-1 text-[11px] text-gray-500">{{ getEventMeta(item) }}</div>
+        <pre class="mt-2 whitespace-pre-wrap">{{ getEventPayload(item) }}</pre>
       </div>
     </div>
 

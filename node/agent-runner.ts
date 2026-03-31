@@ -36,6 +36,7 @@ export type ServerEvent =
   | Extract<SessionEvent, { type: 'session.sdk.message' }>
   | Extract<SessionEvent, { type: 'session.sdk.control.requested' }>
   | Extract<SessionEvent, { type: 'session.sdk.control.resolved' }>
+  | Extract<SessionEvent, { type: 'session.sdk.transport' }>
   | Extract<SessionEvent, { type: 'session.run.state_changed' }>
 
 export type AgentEventHandler = (event: ServerEvent) => void
@@ -56,7 +57,8 @@ function isRunnerRuntimeEvent(value: unknown): value is RunnerRuntimeEvent {
     record.type === 'run.cancelled' ||
     record.type === 'sdk.message' ||
     record.type === 'sdk.control.requested' ||
-    record.type === 'sdk.control.resolved'
+    record.type === 'sdk.control.resolved' ||
+    record.type === 'sdk.transport'
   )
 }
 
@@ -98,6 +100,12 @@ function toServerEvent(runId: string, event: RunnerRuntimeEvent): ServerEvent | 
         receivedAt: event.receivedAt,
         sequence: event.sequence,
         ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      }
+    case 'sdk.transport':
+      return {
+        type: 'session.sdk.transport',
+        runId,
+        event: event.event,
       }
     default:
       return null
@@ -158,14 +166,18 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
   const parser = createOutputParser((event) => {
     events.push(event)
     if (!isRunnerRuntimeEvent(event)) return
-    if (event.sessionId) sessionId = event.sessionId
+    if (event.type === 'sdk.transport') {
+      if (event.event.sessionId) sessionId = event.event.sessionId
+    } else if (event.sessionId) {
+      sessionId = event.sessionId
+    }
     if (events.length === 1 || events.length % EVENT_LOG_INTERVAL === 0) {
       logger.debug('runner:stdout:event', {
         runId: shortId(runId),
         pid: child.pid,
         count: events.length,
         type: event.type,
-        sessionId: shortId(event.sessionId),
+        sessionId: shortId(event.type === 'sdk.transport' ? event.event.sessionId : event.sessionId),
       })
     }
     const serverEvent = toServerEvent(runId, event)
