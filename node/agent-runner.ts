@@ -1,0 +1,258 @@
+import { spawn, type ChildProcess } from 'node:child_process'
+import { resolve } from 'node:path'
+import { randomUUID } from 'node:crypto'
+import { CONFIG } from './config.js'
+import { createOutputParser, type AgentEvent } from './agent-output-parser.js'
+import type { RunnerRuntimeEvent, SessionEvent } from '../shared/message-types.js'
+import { createLogger, shortId } from './logger.js'
+export type { AgentEvent } from './agent-output-parser.js'
+
+const logger = createLogger('agent-runner')
+const EVENT_LOG_INTERVAL = 20
+
+export interface AgentInput {
+  prompt: string
+  sessionId?: string
+  workspacePath: string
+  systemPrompt?: string
+  model?: string
+}
+
+export interface AgentRunResult {
+  sessionId?: string
+  events: AgentEvent[]
+  exitCode: number | null
+  error?: string
+}
+
+export interface AgentRunHandle {
+  done: Promise<AgentRunResult>
+  respondToPermission: (permissionId: string, decision: 'approve' | 'deny') => void
+  respondToElicitation: (requestId: string, response: { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, string | number | boolean | string[]> }) => void
+  cancel: () => void
+}
+
+export type ServerEvent =
+  | Extract<SessionEvent, { type: 'session.sdk.message' }>
+  | Extract<SessionEvent, { type: 'session.sdk.control.requested' }>
+  | Extract<SessionEvent, { type: 'session.sdk.control.resolved' }>
+  | Extract<SessionEvent, { type: 'session.run.state_changed' }>
+
+export type AgentEventHandler = (event: ServerEvent) => void
+
+function writeCommand(child: ChildProcess, message: unknown) {
+  if (!child.stdin || child.stdin.destroyed) return
+  child.stdin.write(`${JSON.stringify(message)}\n`)
+}
+
+function isRunnerRuntimeEvent(value: unknown): value is RunnerRuntimeEvent {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return typeof record.type === 'string' && (
+    record.type === 'run.started' ||
+    record.type === 'run.state_changed' ||
+    record.type === 'run.completed' ||
+    record.type === 'run.failed' ||
+    record.type === 'run.cancelled' ||
+    record.type === 'sdk.message' ||
+    record.type === 'sdk.control.requested' ||
+    record.type === 'sdk.control.resolved'
+  )
+}
+
+function toServerEvent(runId: string, event: RunnerRuntimeEvent): ServerEvent | null {
+  switch (event.type) {
+    case 'run.state_changed':
+      return {
+        type: 'session.run.state_changed',
+        runId,
+        state: event.state,
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      }
+    case 'sdk.message':
+      return {
+        type: 'session.sdk.message',
+        runId,
+        payload: event.payload,
+        ...(event.parsed ? { parsed: event.parsed } : {}),
+        receivedAt: event.receivedAt,
+        sequence: event.sequence,
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      }
+    case 'sdk.control.requested':
+      return {
+        type: 'session.sdk.control.requested',
+        runId,
+        interaction: event.interaction,
+        ...(event.payload !== undefined ? { payload: event.payload } : {}),
+        receivedAt: event.receivedAt,
+        sequence: event.sequence,
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      }
+    case 'sdk.control.resolved':
+      return {
+        type: 'session.sdk.control.resolved',
+        runId,
+        interaction: event.interaction,
+        ...(event.payload !== undefined ? { payload: event.payload } : {}),
+        receivedAt: event.receivedAt,
+        sequence: event.sequence,
+        ...(event.sessionId ? { sessionId: event.sessionId } : {}),
+      }
+    default:
+      return null
+  }
+}
+
+export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, signal?: AbortSignal, runId: string = randomUUID()): AgentRunHandle {
+  const agentPath = resolve(CONFIG.agentRunnerPath)
+  const events: AgentEvent[] = []
+  const startedAt = Date.now()
+  let sessionId: string | undefined = input.sessionId
+  let stderrOutput = ''
+
+  logger.info('runner:spawn:start', {
+    runId: shortId(runId),
+    sessionId: shortId(input.sessionId),
+    workspacePath: input.workspacePath,
+    promptLength: input.prompt.length,
+    model: input.model || CONFIG.defaultModel || '(default)',
+  })
+
+  const child: ChildProcess = spawn('npx', ['tsx', agentPath], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: {
+      ...process.env,
+      NODE_OPTIONS: '--max-old-space-size=4096',
+    },
+    cwd: process.cwd(),
+  })
+
+  logger.info('runner:spawned', {
+    runId: shortId(runId),
+    pid: child.pid,
+  })
+
+  const timeout = setTimeout(() => {
+    logger.warn('runner:timeout', {
+      runId: shortId(runId),
+      pid: child.pid,
+      timeoutMs: CONFIG.agentTimeoutMs,
+    })
+    child.kill('SIGTERM')
+    setTimeout(() => {
+      child.kill('SIGKILL')
+    }, 5000)
+  }, CONFIG.agentTimeoutMs)
+
+  if (signal) {
+    signal.addEventListener('abort', () => {
+      logger.warn('runner:abort', {
+        runId: shortId(runId),
+        pid: child.pid,
+      })
+      child.kill('SIGTERM')
+    }, { once: true })
+  }
+
+  const parser = createOutputParser((event) => {
+    events.push(event)
+    if (!isRunnerRuntimeEvent(event)) return
+    if (event.sessionId) sessionId = event.sessionId
+    if (events.length === 1 || events.length % EVENT_LOG_INTERVAL === 0) {
+      logger.debug('runner:stdout:event', {
+        runId: shortId(runId),
+        pid: child.pid,
+        count: events.length,
+        type: event.type,
+        sessionId: shortId(event.sessionId),
+      })
+    }
+    const serverEvent = toServerEvent(runId, event)
+    if (serverEvent) onEvent(serverEvent)
+  })
+
+  child.stdout!.on('data', (data: Buffer) => {
+    parser.feed(data.toString())
+  })
+
+  child.stderr!.on('data', (data: Buffer) => {
+    const text = data.toString()
+    stderrOutput += text
+    if (text.trim()) {
+      logger.error('runner:stderr', {
+        runId: shortId(runId),
+        pid: child.pid,
+        output: text.trim().slice(-300),
+      })
+    }
+  })
+
+  const done = new Promise<AgentRunResult>((resolvePromise, reject) => {
+    child.on('error', (err) => {
+      clearTimeout(timeout)
+      parser.flush()
+      logger.error('runner:error', {
+        runId: shortId(runId),
+        pid: child.pid,
+        error: err instanceof Error ? err.message : String(err),
+      })
+      reject(err)
+    })
+
+    child.on('close', (code) => {
+      clearTimeout(timeout)
+      parser.flush()
+      logger.info('runner:close', {
+        runId: shortId(runId),
+        pid: child.pid,
+        exitCode: code,
+        sessionId: shortId(sessionId),
+        eventCount: events.length,
+        durationMs: Date.now() - startedAt,
+        stderrTail: code !== 0 ? stderrOutput.slice(-300) : undefined,
+      })
+      resolvePromise({
+        sessionId,
+        events,
+        exitCode: code,
+        error: code !== 0 ? stderrOutput.slice(-500) : undefined,
+      })
+    })
+  })
+
+  writeCommand(child, { type: 'run.start', input })
+
+  return {
+    done,
+    respondToPermission(permissionId, decision) {
+      logger.info('runner:permission:respond', {
+        runId: shortId(runId),
+        permissionId: shortId(permissionId),
+        decision,
+      })
+      writeCommand(child, { type: 'interaction.permission.respond', permissionId, decision })
+    },
+    respondToElicitation(requestId, response) {
+      logger.info('runner:elicitation:respond', {
+        runId: shortId(runId),
+        requestId: shortId(requestId),
+        action: response.action,
+      })
+      writeCommand(child, { type: 'interaction.elicitation.respond', requestId, response })
+    },
+    cancel() {
+      logger.warn('runner:cancel', {
+        runId: shortId(runId),
+        sessionId: shortId(sessionId),
+      })
+      onEvent({ type: 'session.run.state_changed', runId, state: 'cancelled', ...(sessionId ? { sessionId } : {}) })
+      writeCommand(child, { type: 'run.cancel' })
+      child.kill('SIGTERM')
+    },
+  }
+}
+
+export function runAgent(input: AgentInput, onEvent: AgentEventHandler, signal?: AbortSignal, runId?: string): Promise<AgentRunResult> {
+  return createAgentRun(input, onEvent, signal, runId).done
+}

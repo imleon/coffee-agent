@@ -1,5 +1,5 @@
 /**
- * Custom MCP tools for Coffee Agent.
+ * Custom MCP tools for Cotta.
  * These will be registered via createSdkMcpServer() in future iterations.
  * 
  * Planned tools:

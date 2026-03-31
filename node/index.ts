@@ -9,14 +9,10 @@ import { createWebRoutes } from './web.js'
 const app = new Hono()
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app })
 
-// API + WebSocket
 const webRoutes = createWebRoutes(upgradeWebSocket)
 app.route('/', webRoutes)
-
-// 托管前端构建产物
 app.use('/*', serveStatic({ root: './web/dist' }))
 
-// SPA fallback — 非 API 路由都返回 index.html
 app.get('*', (c) => {
   const index = './web/dist/index.html'
   if (existsSync(index)) {
@@ -25,11 +21,8 @@ app.get('*', (c) => {
   return c.text('Frontend not built. Run: npm run build:web', 404)
 })
 
-const server = serve(
-  { fetch: app.fetch, port: CONFIG.port, hostname: CONFIG.host },
-  (info) => {
-    console.log(`☕ Coffee Agent running at http://${info.address}:${info.port}`)
-  }
-)
+const server = serve({ fetch: app.fetch, port: CONFIG.port, hostname: CONFIG.host }, (info) => {
+  console.log(`Cotta running at http://${info.address}:${info.port}`)
+})
 
 injectWebSocket(server)

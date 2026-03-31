@@ -1,14 +1,14 @@
 <script setup lang="ts">
 import { ref } from 'vue'
-import { useChatStore } from '../stores/chat'
+import { useSessionStore } from '../stores/session'
 
-const chat = useChatStore()
+const session = useSessionStore()
 const input = ref('')
 
 function send() {
   const text = input.value.trim()
-  if (!text || chat.isLoading) return
-  chat.sendMessage(text)
+  if (!text || session.hasActiveRun || session.isAwaitingInteraction) return
+  session.sendMessage(text)
   input.value = ''
 }
 
@@ -26,23 +26,26 @@ function onKeydown(e: KeyboardEvent) {
       <textarea
         v-model="input"
         @keydown="onKeydown"
-        :disabled="!chat.isConnected"
-        placeholder="Type a message... (Enter to send, Shift+Enter for new line)"
+        :disabled="!session.isConnected || session.hasActiveRun || session.isAwaitingInteraction"
+        :placeholder="session.isAwaitingInteraction ? 'Waiting for interaction response...' : 'Send SDK-facing input... (Enter to send, Shift+Enter for new line)'"
         rows="1"
         class="flex-1 resize-none rounded-xl border border-gray-300 px-4 py-3 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
       />
       <button
         @click="send"
-        :disabled="!input.trim() || chat.isLoading || !chat.isConnected"
+        :disabled="!input.trim() || session.hasActiveRun || !session.isConnected || session.isAwaitingInteraction"
         class="px-5 py-3 bg-blue-600 text-white rounded-xl text-sm font-medium hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
       >
         Send
       </button>
     </div>
-    <div v-if="chat.authRequired && !chat.hasAuthToken" class="text-center text-xs text-amber-600 mt-2">
+    <div v-if="session.authRequired && !session.hasAuthToken" class="text-center text-xs text-amber-600 mt-2">
       Waiting for access token...
     </div>
-    <div v-else-if="!chat.isConnected" class="text-center text-xs text-red-500 mt-2">
+    <div v-else-if="session.isAwaitingInteraction" class="text-center text-xs text-amber-600 mt-2">
+      Waiting for interaction response...
+    </div>
+    <div v-else-if="!session.isConnected" class="text-center text-xs text-red-500 mt-2">
       Disconnected — reconnecting...
     </div>
   </div>

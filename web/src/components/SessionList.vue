@@ -1,13 +1,13 @@
 <script setup lang="ts">
-import { useChatStore } from '../stores/chat'
+import { useSessionStore } from '../stores/session'
 
-const chat = useChatStore()
+const sessionStore = useSessionStore()
 </script>
 
 <template>
   <div class="flex flex-col">
     <button
-      @click="chat.newChat()"
+      @click="sessionStore.newChat()"
       class="m-3 px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg text-sm font-medium transition-colors"
     >
       + New Chat
@@ -15,17 +15,17 @@ const chat = useChatStore()
 
     <div class="px-2">
       <button
-        v-for="session in chat.sessions"
-        :key="session.id"
-        @click="chat.selectSession(session.id)"
+        v-for="item in sessionStore.sessions"
+        :key="item.id"
+        @click="sessionStore.selectSession(item.id)"
         class="w-full text-left px-3 py-2 rounded-lg text-sm truncate transition-colors"
         :class="
-          chat.currentSessionId === session.id
+          sessionStore.currentSessionId === item.id
             ? 'bg-gray-700 text-white'
             : 'text-gray-300 hover:bg-gray-800'
         "
       >
-        {{ session.title }}
+        {{ item.title }}
       </button>
     </div>
   </div>

@@ -1,7 +1,4 @@
-/**
- * Simple task queue with concurrency control.
- * Limits the number of concurrent agent executions.
- */
+import { createLogger } from './logger.js'
 
 type TaskFn<T> = () => Promise<T>
 
@@ -9,7 +6,10 @@ interface QueuedTask<T> {
   fn: TaskFn<T>
   resolve: (value: T) => void
   reject: (reason: unknown) => void
+  enqueuedAt: number
 }
+
+const logger = createLogger('queue')
 
 export class TaskQueue {
   private queue: QueuedTask<unknown>[] = []
@@ -22,7 +22,12 @@ export class TaskQueue {
 
   async enqueue<T>(fn: TaskFn<T>): Promise<T> {
     return new Promise<T>((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject } as QueuedTask<unknown>)
+      this.queue.push({ fn, resolve, reject, enqueuedAt: Date.now() } as QueuedTask<unknown>)
+      logger.info('queue:enqueue', {
+        pending: this.queue.length,
+        active: this.running,
+        maxConcurrency: this.maxConcurrency,
+      })
       this.processNext()
     })
   }
@@ -42,6 +47,13 @@ export class TaskQueue {
 
     const task = this.queue.shift()!
     this.running++
+    const startedAt = Date.now()
+    logger.info('queue:start', {
+      pending: this.queue.length,
+      active: this.running,
+      maxConcurrency: this.maxConcurrency,
+      waitMs: startedAt - task.enqueuedAt,
+    })
 
     try {
       const result = await task.fn()
@@ -50,6 +62,12 @@ export class TaskQueue {
       task.reject(error)
     } finally {
       this.running--
+      logger.info('queue:finish', {
+        pending: this.queue.length,
+        active: this.running,
+        maxConcurrency: this.maxConcurrency,
+        durationMs: Date.now() - startedAt,
+      })
       this.processNext()
     }
   }

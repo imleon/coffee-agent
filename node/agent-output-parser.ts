@@ -1,24 +1,12 @@
-/**
- * Parses Agent Runner stdout using the marker protocol:
- *   ---OUTPUT_START---
- *   { JSON payload }
- *   ---OUTPUT_END---
- */
+import { createLogger } from './logger.js'
 
 const OUTPUT_START = '---OUTPUT_START---'
 const OUTPUT_END = '---OUTPUT_END---'
+const logger = createLogger('output-parser')
 
-export interface AgentEvent {
-  type: string
-  content: unknown
-}
-
+export type AgentEvent = Record<string, unknown>
 export type EventCallback = (event: AgentEvent) => void
 
-/**
- * Creates a streaming parser for the marker-delimited protocol.
- * Call `feed(chunk)` as data arrives from stdout.
- */
 export function createOutputParser(onEvent: EventCallback) {
   let buffer = ''
 
@@ -30,13 +18,9 @@ export function createOutputParser(onEvent: EventCallback) {
       if (startIdx === -1) break
 
       const endIdx = buffer.indexOf(OUTPUT_END, startIdx)
-      if (endIdx === -1) break // incomplete, wait for more data
+      if (endIdx === -1) break
 
-      const jsonStr = buffer.slice(
-        startIdx + OUTPUT_START.length,
-        endIdx
-      ).trim()
-
+      const jsonStr = buffer.slice(startIdx + OUTPUT_START.length, endIdx).trim()
       buffer = buffer.slice(endIdx + OUTPUT_END.length)
 
       if (jsonStr) {
@@ -44,15 +28,17 @@ export function createOutputParser(onEvent: EventCallback) {
           const event = JSON.parse(jsonStr) as AgentEvent
           onEvent(event)
         } catch (e) {
-          console.error('[OutputParser] Failed to parse JSON:', e)
-          console.error('[OutputParser] Raw:', jsonStr.slice(0, 200))
+          logger.error('parser:invalid-json', {
+            error: e instanceof Error ? e.message : String(e),
+            raw: jsonStr.slice(0, 200),
+            length: jsonStr.length,
+          })
         }
       }
     }
 
-    // Prevent buffer from growing unbounded with non-protocol output
-    // Keep only the last chunk that might contain a partial marker
     if (buffer.length > 100_000 && !buffer.includes(OUTPUT_START.slice(0, 3))) {
+      logger.warn('parser:buffer-reset', { length: buffer.length })
       buffer = ''
     }
   }
