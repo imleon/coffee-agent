@@ -7,6 +7,7 @@ import type {
   SessionMessageBlock,
   SessionRunState,
   SessionSummary,
+  SessionTransportLogEntry,
   SdkMessageLayer,
 } from '../../../shared/message-types.js'
 import {
@@ -56,6 +57,12 @@ export type TimelineItem = SdkTimelineItem | HistoryTimelineItem
 interface HealthResponse {
   status?: string
   authEnabled?: boolean
+}
+
+interface TransportLogsResponse {
+  items?: SessionTransportLogEntry[]
+  hasMore?: boolean
+  nextCursor?: number | null
 }
 
 const AUTH_TOKEN_STORAGE_KEY = 'cotta-auth-token'
@@ -120,7 +127,6 @@ export const useSessionStore = defineStore('session', () => {
   const activeRunId = ref<string | null>(null)
   const pendingInteraction = ref<PendingInteraction | null>(null)
   const eventLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.message' }>>>([])
-  const transportLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.transport' }>>>([])
 
   const isLoading = computed(() => ['queued', 'running', 'requires_action'].includes(runState.value))
   const hasAuthToken = computed(() => authToken.value.trim().length > 0)
@@ -128,7 +134,6 @@ export const useSessionStore = defineStore('session', () => {
   const isAwaitingInteraction = computed(() => pendingInteraction.value?.status === 'pending')
   const hasActiveRun = computed(() => awaitingRunStart || activeRunId.value !== null)
   const sdkEvents = computed(() => eventLog.value)
-  const sdkTransportEvents = computed(() => transportLog.value)
   const telemetry = computed(() => eventLog.value.filter((event) => !isBusinessSdkMessage(event.payload)))
   const observabilityEvents = computed(() => eventLog.value.filter((event) => {
     if (getSdkMessageLayer(event.payload) !== 'debug-observability') return false
@@ -302,17 +307,13 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   function applyTransportEvent(event: Extract<SessionEvent, { type: 'session.sdk.transport' }>) {
-    transportLog.value = [...transportLog.value.slice(-199), event]
     syncSessionId(event.event.sessionId)
-    if (transportLog.value.length === 1 || transportLog.value.length % EVENT_LOG_INTERVAL === 0) {
-      logger.debug('chat:sdk-transport', {
-        count: transportLog.value.length,
-        direction: event.event.direction,
-        eventName: event.event.eventName,
-        sequence: event.event.sequence,
-        sessionId: shortId(event.event.sessionId),
-      })
-    }
+    logger.debug('chat:sdk-transport:ignored-ws', {
+      direction: event.event.direction,
+      eventName: event.event.eventName,
+      sequence: event.event.sequence,
+      sessionId: shortId(event.event.sessionId),
+    })
   }
 
   function applyEvent(event: SessionEvent) {
@@ -624,7 +625,6 @@ export const useSessionStore = defineStore('session', () => {
     currentSessionId.value = null
     historyMessages.value = []
     eventLog.value = []
-    transportLog.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -637,7 +637,6 @@ export const useSessionStore = defineStore('session', () => {
     currentSessionId.value = id
     historyMessages.value = []
     eventLog.value = []
-    transportLog.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -771,7 +770,6 @@ export const useSessionStore = defineStore('session', () => {
     historyMessages.value = []
     sessions.value = []
     eventLog.value = []
-    transportLog.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -794,12 +792,10 @@ export const useSessionStore = defineStore('session', () => {
     activeRunId,
     pendingInteraction,
     sdkEvents,
-    sdkTransportEvents,
     telemetry,
     observabilityEvents,
     runStateEvents,
     eventLog,
-    transportLog,
     isAwaitingApproval,
     isAwaitingInteraction,
     connect,

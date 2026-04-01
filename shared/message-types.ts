@@ -80,6 +80,18 @@ export interface SdkTransportEvent extends RuntimeEnvelopeBase {
   payload?: unknown
 }
 
+export interface SessionTransportLogEntry {
+  cursor: number
+  runId: string
+  event: SdkTransportEvent & { sessionId: string }
+}
+
+export interface SessionTransportLogPage {
+  items: SessionTransportLogEntry[]
+  hasMore: boolean
+  nextCursor: number | null
+}
+
 export type RunnerAgentInput = {
   prompt: string
   sessionId?: string

@@ -5,6 +5,7 @@ import { CONFIG } from './config.js'
 import { createOutputParser, type AgentEvent } from './agent-output-parser.js'
 import type { RunnerRuntimeEvent, SessionEvent } from '../shared/message-types.js'
 import { createLogger, shortId } from './logger.js'
+import { appendSessionTransportLog } from './transport-logs.js'
 export type { AgentEvent } from './agent-output-parser.js'
 
 const logger = createLogger('agent-runner')
@@ -168,6 +169,13 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
     if (!isRunnerRuntimeEvent(event)) return
     if (event.type === 'sdk.transport') {
       if (event.event.sessionId) sessionId = event.event.sessionId
+      void appendSessionTransportLog(runId, event.event).catch((error) => {
+        logger.error('runner:transport-log:append-error', {
+          runId: shortId(runId),
+          sessionId: shortId(event.event.sessionId),
+          error: error instanceof Error ? error.message : String(error),
+        })
+      })
     } else if (event.sessionId) {
       sessionId = event.sessionId
     }

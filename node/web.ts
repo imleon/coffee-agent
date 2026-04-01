@@ -7,6 +7,7 @@ import { createAgentRun, type AgentRunHandle, type ServerEvent } from './agent-r
 import type { SessionEvent } from '../shared/message-types.js'
 import { TaskQueue } from './queue.js'
 import { listAllSessions, getMessages } from './sessions.js'
+import { readSessionTransportLogs } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
 
 const queue = new TaskQueue(CONFIG.maxConcurrentAgents)
@@ -89,13 +90,8 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
 
   app.get('/api/sessions', async (c) => {
     const startedAt = Date.now()
-    logger.info('http:sessions:list:start')
     try {
       const sessions = await listAllSessions()
-      logger.info('http:sessions:list:success', {
-        count: sessions.length,
-        durationMs: Date.now() - startedAt,
-      })
       return c.json({ sessions })
     } catch (err) {
       logger.error('http:sessions:list:error', {
@@ -129,6 +125,25 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
         durationMs: Date.now() - startedAt,
       })
       return c.json({ messages: [], error: String(err) })
+    }
+  })
+
+  app.get('/api/sessions/:id/transport-logs', async (c) => {
+    const startedAt = Date.now()
+    try {
+      const id = c.req.param('id')
+      const limit = parseInt(c.req.query('limit') || '100', 10)
+      const cursorRaw = c.req.query('cursor')
+      const follow = c.req.query('follow') === '1'
+      const cursor = cursorRaw ? parseInt(cursorRaw, 10) : null
+      const page = await readSessionTransportLogs(id, Number.isFinite(cursor) ? cursor : null, limit, follow)
+      return c.json(page)
+    } catch (err) {
+      logger.error('http:transport-logs:error', {
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      })
+      return c.json({ items: [], hasMore: false, nextCursor: null, error: String(err) })
     }
   })
 
@@ -323,6 +338,9 @@ function handleMessageCreate(
     }, (event: ServerEvent) => {
       const sessionEvent = toSessionEvent(event)
       if ('sessionId' in sessionEvent && sessionEvent.sessionId) state.sessionId = sessionEvent.sessionId
+      if (event.type === 'session.sdk.transport') {
+        return
+      }
       forwardedEvents += 1
       setForwardedEvents(forwardedEvents)
       if (forwardedEvents === 1 || forwardedEvents % EVENT_LOG_INTERVAL === 0) {

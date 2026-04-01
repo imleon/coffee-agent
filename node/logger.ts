@@ -30,7 +30,7 @@ function isSensitiveKey(key: string): boolean {
     || normalized === 'auth'
 }
 
-function sanitizeValue(value: unknown, depth: number = 0): unknown {
+export function sanitizeValue(value: unknown, depth: number = 0): unknown {
   if (value == null) return value
   if (typeof value === 'string') return sanitizeString(value)
   if (typeof value === 'number' || typeof value === 'boolean') return value
