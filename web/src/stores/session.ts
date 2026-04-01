@@ -15,6 +15,7 @@ import {
   isRunStateSdkMessage,
 } from '../../../shared/message-types.js'
 import {
+  normalizeSdkEnvelopeMessage,
   normalizeStoredTranscriptMessage,
 } from '../../../shared/transcript-normalizer.js'
 import { createDebugLogger } from '../lib/debug.js'
@@ -46,7 +47,7 @@ export interface RunStateSdkEventItem {
 export interface HistoryTimelineItem {
   kind: 'history-message'
   key: string
-  message: SessionMessage
+  message: HistoryMessage
   timestamp: number
 }
 
@@ -60,6 +61,12 @@ interface HealthResponse {
 const AUTH_TOKEN_STORAGE_KEY = 'cotta-auth-token'
 const logger = createDebugLogger('session-store')
 const EVENT_LOG_INTERVAL = 20
+const OPTIMISTIC_USER_MATCH_WINDOW_MS = 30_000
+
+type HistoryMessage = SessionMessage & {
+  optimistic?: boolean
+  localId?: string
+}
 
 function normalizeSession(item: any): SessionSummary {
   return {
@@ -89,8 +96,19 @@ function redactUrl(url: URL): string {
   return safe.toString()
 }
 
+function getTimelineMessageFromEvent(event: Extract<SessionEvent, { type: 'session.sdk.message' }>): SessionMessage | null {
+  return event.parsed ?? normalizeSdkEnvelopeMessage(event.payload)
+}
+
+function isMatchingOptimisticUserMessage(message: HistoryMessage, candidate: SessionMessage, timestamp: number): boolean {
+  if (!message.optimistic || message.role !== 'user' || candidate.role !== 'user') return false
+  if (message.content.trim() !== candidate.content.trim()) return false
+  const messageTimestamp = typeof message.timestamp === 'number' ? message.timestamp : 0
+  return Math.abs(messageTimestamp - timestamp) <= OPTIMISTIC_USER_MATCH_WINDOW_MS
+}
+
 export const useSessionStore = defineStore('session', () => {
-  const historyMessages = ref<SessionMessage[]>([])
+  const historyMessages = ref<HistoryMessage[]>([])
   const sessions = ref<SessionSummary[]>([])
   const currentSessionId = ref<string | null>(null)
   const isConnected = ref(false)
@@ -145,14 +163,40 @@ export const useSessionStore = defineStore('session', () => {
       timestamp: typeof message.timestamp === 'number' ? message.timestamp : index,
     }))
   )
-  const timeline = computed<TimelineItem[]>(() => [
-    ...historyTimeline.value,
-    ...liveSdkTimeline.value,
-  ])
+  const timeline = computed<TimelineItem[]>(() => {
+    const items = [...historyTimeline.value, ...liveSdkTimeline.value]
+    return items.sort((left, right) => {
+      if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
+
+      if (left.kind === 'sdk-message' && right.kind === 'sdk-message') {
+        return left.event.sequence - right.event.sequence
+      }
+
+      if (left.kind === 'history-message' && right.kind === 'history-message') {
+        return left.key.localeCompare(right.key)
+      }
+
+      const leftRole = left.kind === 'history-message'
+        ? left.message.role
+        : getTimelineMessageFromEvent(left.event)?.role
+      const rightRole = right.kind === 'history-message'
+        ? right.message.role
+        : getTimelineMessageFromEvent(right.event)?.role
+
+      if (leftRole === rightRole) {
+        return left.kind === 'history-message' ? -1 : 1
+      }
+
+      if (leftRole === 'user') return -1
+      if (rightRole === 'user') return 1
+      return left.kind === 'history-message' ? -1 : 1
+    })
+  })
 
   let ws: WebSocket | null = null
   let awaitingRunStart = false
   let observedEventCount = 0
+  let optimisticMessageCount = 0
 
   function persistAuthToken(token: string) {
     authToken.value = token.trim()
@@ -232,6 +276,19 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   function applySdkMessage(event: Extract<SessionEvent, { type: 'session.sdk.message' }>) {
+    const parsedMessage = getTimelineMessageFromEvent(event)
+    const eventTimestamp = typeof event.receivedAt === 'number' ? event.receivedAt : Date.now()
+
+    if (parsedMessage?.role === 'user') {
+      let removedOptimistic = false
+      historyMessages.value = historyMessages.value.filter((message) => {
+        if (removedOptimistic) return true
+        if (!isMatchingOptimisticUserMessage(message, parsedMessage, eventTimestamp)) return true
+        removedOptimistic = true
+        return false
+      })
+    }
+
     eventLog.value = [...eventLog.value.slice(-199), event]
     syncSessionId(event.sessionId)
     if (eventLog.value.length === 1 || eventLog.value.length % EVENT_LOG_INTERVAL === 0) {
@@ -307,6 +364,9 @@ export const useSessionStore = defineStore('session', () => {
           hasError: Boolean(event.error),
         })
         fetchSessions()
+        if (event.sessionId && currentSessionId.value === event.sessionId) {
+          loadSessionMessages(event.sessionId)
+        }
         break
 
       case 'session.run.failed':
@@ -511,12 +571,15 @@ export const useSessionStore = defineStore('session', () => {
     activeRunId.value = null
     pendingInteraction.value = null
     runState.value = 'queued'
+    optimisticMessageCount += 1
     historyMessages.value = [
       ...historyMessages.value,
       {
         role: 'user',
         content: trimmed,
         timestamp: Date.now(),
+        optimistic: true,
+        localId: `optimistic-${optimisticMessageCount}`,
       },
     ]
     logger.info('chat:send', {
@@ -563,6 +626,7 @@ export const useSessionStore = defineStore('session', () => {
     eventLog.value = []
     transportLog.value = []
     observedEventCount = 0
+    optimisticMessageCount = 0
     clearRunState('idle')
   }
 
@@ -575,6 +639,7 @@ export const useSessionStore = defineStore('session', () => {
     eventLog.value = []
     transportLog.value = []
     observedEventCount = 0
+    optimisticMessageCount = 0
     clearRunState('idle')
     loadSessionMessages(id)
   }
@@ -594,6 +659,10 @@ export const useSessionStore = defineStore('session', () => {
       }
       const data = await res.json()
       historyMessages.value = (data.messages || []).map((m: unknown) => normalizeStoredTranscriptMessage(m))
+      eventLog.value = eventLog.value.filter((event) => {
+        if (!event.sessionId || event.sessionId !== id) return true
+        return !isBusinessSdkMessage(event.payload)
+      })
       logger.info('messages:load:success', {
         sessionId: shortId(id),
         count: historyMessages.value.length,
@@ -704,6 +773,7 @@ export const useSessionStore = defineStore('session', () => {
     eventLog.value = []
     transportLog.value = []
     observedEventCount = 0
+    optimisticMessageCount = 0
     clearRunState('idle')
   }
 
