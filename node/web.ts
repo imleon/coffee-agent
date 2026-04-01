@@ -1,14 +1,19 @@
 import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { readFile } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import type { UpgradeWebSocket } from 'hono/ws'
 import { CONFIG } from './config.js'
 import { createAgentRun, type AgentRunHandle, type ServerEvent } from './agent-runner.js'
-import type { SessionEvent } from '../shared/message-types.js'
+import type { SessionEvent, StaticMetadataSnapshot, StaticMetadataTreeNode } from '../shared/message-types.js'
 import { TaskQueue } from './queue.js'
 import { listAllSessions, getMessages } from './sessions.js'
 import { readSessionRuntimeLogs, readSessionTransportLogs } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
+import { buildSdkExportTree, mapTree, overlayNodeValues } from './sdk-type-tree.js'
 
 const queue = new TaskQueue(CONFIG.maxConcurrentAgents)
 const logger = createLogger('web')
@@ -23,6 +28,320 @@ type ActiveRunState = {
   abortController: AbortController
   canceled: boolean
   sessionId?: string
+}
+
+const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+const SDK_DIR = resolve(ROOT_DIR, 'node_modules/@anthropic-ai/claude-agent-sdk')
+const PROJECT_CLAUDE_DIR = resolve(ROOT_DIR, '.claude')
+const SETTINGS_LOCAL_PATH = resolve(PROJECT_CLAUDE_DIR, 'settings.local.json')
+const USER_STATE_PATH = resolve(homedir(), '.claude.json')
+const SDK_PACKAGE_JSON_PATH = resolve(SDK_DIR, 'package.json')
+const SDK_MANIFEST_JSON_PATH = resolve(SDK_DIR, 'manifest.json')
+const SDK_DTS_PATH = resolve(SDK_DIR, 'sdk.d.ts')
+
+function createNode(input: {
+  key: string
+  path: string
+  label?: string
+  kind: StaticMetadataTreeNode['kind']
+  status?: StaticMetadataTreeNode['status']
+  description?: string
+  source?: string
+  value?: unknown
+  requiresSession?: boolean
+  children?: StaticMetadataTreeNode[]
+  meta?: Record<string, unknown>
+}): StaticMetadataTreeNode {
+  return {
+    key: input.key,
+    path: input.path,
+    label: input.label ?? input.key,
+    kind: input.kind,
+    status: input.status ?? 'resolved',
+    ...(input.description ? { description: input.description } : {}),
+    ...(input.source ? { source: input.source } : {}),
+    ...(input.value !== undefined ? { value: input.value } : {}),
+    ...(input.requiresSession ? { requiresSession: true } : {}),
+    ...(input.children ? { children: input.children } : {}),
+    ...(input.meta ? { meta: input.meta } : {}),
+  }
+}
+
+function inferKind(value: unknown): StaticMetadataTreeNode['kind'] {
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return 'array'
+  switch (typeof value) {
+    case 'string':
+      return 'string'
+    case 'number':
+      return 'number'
+    case 'boolean':
+      return 'boolean'
+    case 'object':
+      return 'object'
+    default:
+      return 'unknown'
+  }
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : null
+}
+
+function toLabel(key: string): string {
+  if (!key) return key
+  return key
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/[_-]+/g, ' ')
+    .replace(/^./, (char) => char.toUpperCase())
+}
+
+function objectFromEntries(value: Record<string, unknown>, path: string, source: string, description?: string): StaticMetadataTreeNode {
+  const children = Object.entries(value).map(([key, entry]) => valueToNode(`${path}.${key}`, entry, source))
+  return createNode({
+    key: path.split('.').pop() || path,
+    path,
+    label: toLabel(path.split('.').pop() || path),
+    kind: 'object',
+    source,
+    description,
+    value,
+    children,
+  })
+}
+
+function arrayToNode(path: string, items: unknown[], source: string, description?: string): StaticMetadataTreeNode {
+  const children = items.map((item, index) => valueToNode(`${path}[${index}]`, item, source))
+  return createNode({
+    key: path.split('.').pop() || path,
+    path,
+    label: toLabel(path.split('.').pop() || path),
+    kind: 'array',
+    source,
+    description,
+    value: items,
+    children,
+    meta: { length: items.length },
+  })
+}
+
+function valueToNode(path: string, value: unknown, source: string, description?: string): StaticMetadataTreeNode {
+  const key = path.endsWith(']') ? path.slice(path.lastIndexOf('[') + 1, -1) : path.split('.').pop() || path
+  if (Array.isArray(value)) {
+    return arrayToNode(path, value, source, description)
+  }
+  const record = asRecord(value)
+  if (record) {
+    return objectFromEntries(record, path, source, description)
+  }
+  return createNode({
+    key,
+    path,
+    label: toLabel(key),
+    kind: inferKind(value),
+    source,
+    description,
+    value,
+  })
+}
+
+async function readJsonFile(path: string): Promise<unknown | undefined> {
+  try {
+    const text = await readFile(path, 'utf-8')
+    return JSON.parse(text)
+  } catch {
+    return undefined
+  }
+}
+
+function buildInstallGroup(pkg: unknown, manifest: unknown): StaticMetadataTreeNode {
+  const source = 'sdk package.json + manifest.json'
+  const packageNode = valueToNode('install.package', pkg ?? {}, 'sdk package.json', 'SDK npm 包元数据')
+  const manifestNode = valueToNode('install.manifest', manifest ?? {}, 'sdk manifest.json', 'Claude Code 安装清单')
+  return createNode({
+    key: 'install',
+    path: 'install',
+    label: 'Install',
+    kind: 'group',
+    source,
+    children: [packageNode, manifestNode],
+  })
+}
+
+function normalizeTreeSource(node: StaticMetadataTreeNode, source: string): StaticMetadataTreeNode {
+  return mapTree(node, (entry) => ({
+    ...entry,
+    source,
+  }))
+}
+
+function markTreeSessionRequired(node: StaticMetadataTreeNode): StaticMetadataTreeNode {
+  return mapTree(node, (entry) => ({
+    ...entry,
+    status: 'session-required',
+    requiresSession: true,
+  }))
+}
+
+function buildAccountGroup(userState: unknown): StaticMetadataTreeNode {
+  const source = 'sdk.d.ts AccountInfo + ~/.claude.json'
+  const state = asRecord(userState)
+  const claude = asRecord(state?.oauthAccount)
+  const accountTree = buildSdkExportTree(SDK_DTS_PATH, 'AccountInfo', 'account', {
+    source,
+    maxDepth: 3,
+  })
+
+  const overlay: Record<string, unknown> = {}
+  if (typeof claude?.emailAddress === 'string') overlay.email = claude.emailAddress
+  if (typeof claude?.organizationName === 'string') overlay.organization = claude.organizationName
+  if (typeof claude?.organizationType === 'string') overlay.subscriptionType = claude.organizationType
+
+  return Object.keys(overlay).length > 0
+    ? overlayNodeValues(accountTree, overlay, source)
+    : accountTree
+}
+
+function buildAgentGroup(): StaticMetadataTreeNode {
+  const source = 'sdk.d.ts AgentInfo / AgentDefinition'
+  return createNode({
+    key: 'agent',
+    path: 'agent',
+    label: 'Agent',
+    kind: 'group',
+    source,
+    children: [
+      buildSdkExportTree(SDK_DTS_PATH, 'AgentInfo', 'agent.agentInfo', {
+        source,
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'AgentDefinition', 'agent.agentDefinition', {
+        source,
+        maxDepth: 4,
+        maxUnionVariants: 12,
+      }),
+    ],
+  })
+}
+
+function buildConfigGroup(localSettings: unknown): StaticMetadataTreeNode {
+  const source = 'project settings + sdk.d.ts'
+  const localSettingsNode = valueToNode('config.localSettings', localSettings ?? {}, 'project .claude/settings.local.json', '项目本地 Claude 配置')
+  const settingsSchemaNode = buildSdkExportTree(SDK_DTS_PATH, 'Settings', 'config.settingsSchema', {
+    source: 'sdk.d.ts Settings',
+    maxDepth: 3,
+    maxProperties: 60,
+    maxUnionVariants: 10,
+  })
+  const pluginNode = buildSdkExportTree(SDK_DTS_PATH, 'SdkPluginConfig', 'config.plugin', {
+    source: 'sdk.d.ts SdkPluginConfig',
+    maxDepth: 3,
+  })
+  const mcpNode = createNode({
+    key: 'mcp',
+    path: 'config.mcp',
+    label: 'Mcp',
+    kind: 'object',
+    source: 'sdk.d.ts MCP types',
+    status: 'unavailable',
+    children: [
+      buildSdkExportTree(SDK_DTS_PATH, 'McpClaudeAIProxyServerConfig', 'config.mcp.claudeAiProxy', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpHttpServerConfig', 'config.mcp.http', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpSdkServerConfig', 'config.mcp.sdk', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpSSEServerConfig', 'config.mcp.sse', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpStdioServerConfig', 'config.mcp.stdio', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpServerStatus', 'config.mcp.status', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 4,
+      }),
+      buildSdkExportTree(SDK_DTS_PATH, 'McpSetServersResult', 'config.mcp.setServersResult', {
+        source: 'sdk.d.ts MCP types',
+        maxDepth: 3,
+      }),
+    ],
+  })
+  return createNode({
+    key: 'config',
+    path: 'config',
+    label: 'Config',
+    kind: 'group',
+    source,
+    children: [localSettingsNode, settingsSchemaNode, pluginNode, mcpNode],
+  })
+}
+
+function buildCapabilitiesGroup(localSettings: unknown, pkg: unknown, userState: unknown): StaticMetadataTreeNode {
+  const settings = asRecord(localSettings)
+  const packageJson = asRecord(pkg)
+  const state = asRecord(userState)
+  const capabilities = {
+    settingsSchema: true,
+    localSettings: Boolean(settings),
+    accountMetadata: Boolean(asRecord(state?.oauthAccount)?.emailAddress),
+    plugins: Array.isArray(settings?.enabledPlugins) || Boolean(settings?.pluginConfigs),
+    mcp: ['enableAllProjectMcpServers', 'enabledMcpjsonServers', 'disabledMcpjsonServers', 'allowedMcpServers', 'deniedMcpServers'].some((key) => key in (settings ?? {})),
+    modelConfig: typeof settings?.model === 'string' || Array.isArray(settings?.availableModels),
+    installMetadata: typeof packageJson?.version === 'string',
+  }
+  return createNode({
+    key: 'capabilities',
+    path: 'capabilities',
+    label: 'Capabilities',
+    kind: 'group',
+    source: 'derived from static sources',
+    children: Object.entries(capabilities).map(([key, value]) => createNode({
+      key,
+      path: `capabilities.${key}`,
+      label: toLabel(key),
+      kind: 'boolean',
+      source: 'derived from static sources',
+      value,
+    })),
+  })
+}
+
+function buildSessionOnlyGroup(): StaticMetadataTreeNode {
+  const source = 'SDKSystemMessage / runtime APIs'
+  const sessionTree = buildSdkExportTree(SDK_DTS_PATH, 'SDKSystemMessage', 'sessionOnly', {
+    source,
+    maxDepth: 3,
+  })
+  return markTreeSessionRequired(normalizeTreeSource(sessionTree, source))
+}
+
+async function buildStaticMetadataSnapshot(): Promise<StaticMetadataSnapshot> {
+  const [pkg, manifest, localSettings, userState] = await Promise.all([
+    readJsonFile(SDK_PACKAGE_JSON_PATH),
+    readJsonFile(SDK_MANIFEST_JSON_PATH),
+    readJsonFile(SETTINGS_LOCAL_PATH),
+    readJsonFile(USER_STATE_PATH),
+  ])
+  return {
+    generatedAt: Date.now(),
+    groups: [
+      buildInstallGroup(pkg, manifest),
+      buildAccountGroup(userState),
+      buildAgentGroup(),
+      buildConfigGroup(localSettings),
+      buildCapabilitiesGroup(localSettings, pkg, userState),
+      buildSessionOnlyGroup(),
+    ],
+  }
 }
 
 function isAuthorizedToken(token?: string | null): boolean {
@@ -163,6 +482,24 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
         durationMs: Date.now() - startedAt,
       })
       return c.json({ items: [], hasMore: false, nextCursor: null, error: String(err) })
+    }
+  })
+
+  app.get('/api/static-metadata', async (c) => {
+    const startedAt = Date.now()
+    try {
+      const snapshot = await buildStaticMetadataSnapshot()
+      logger.info('http:static-metadata:success', {
+        durationMs: Date.now() - startedAt,
+        groups: snapshot.groups.length,
+      })
+      return c.json(snapshot)
+    } catch (err) {
+      logger.error('http:static-metadata:error', {
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      })
+      return c.json({ generatedAt: Date.now(), groups: [], error: String(err) }, 500)
     }
   })
 

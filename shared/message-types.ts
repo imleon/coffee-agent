@@ -183,3 +183,25 @@ export function isBusinessSdkMessage(message: SDKMessage): boolean {
 export function isRunStateSdkMessage(message: SDKMessage): boolean {
   return getSdkMessageLayer(message) === 'run-state'
 }
+
+export type StaticMetadataNodeKind = 'group' | 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null' | 'union' | 'unknown'
+export type StaticMetadataNodeStatus = 'resolved' | 'unavailable' | 'session-required'
+
+export interface StaticMetadataTreeNode {
+  key: string
+  path: string
+  label: string
+  kind: StaticMetadataNodeKind
+  status: StaticMetadataNodeStatus
+  description?: string
+  source?: string
+  value?: unknown
+  requiresSession?: boolean
+  children?: StaticMetadataTreeNode[]
+  meta?: Record<string, unknown>
+}
+
+export interface StaticMetadataSnapshot {
+  generatedAt: number
+  groups: StaticMetadataTreeNode[]
+}

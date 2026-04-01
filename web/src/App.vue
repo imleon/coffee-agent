@@ -4,11 +4,12 @@ import SessionList from './components/SessionList.vue'
 import MessageList from './components/MessageList.vue'
 import InputBar from './components/InputBar.vue'
 import TransportLogView from './components/TransportLogView.vue'
+import StaticMetadataView from './components/StaticMetadataView.vue'
 import { useSessionStore } from './stores/session'
 
 const session = useSessionStore()
 const tokenInput = ref(session.authToken)
-const activeView = ref<'session' | 'log'>('session')
+const activeView = ref<'session' | 'log' | 'metadata'>('session')
 
 function submitToken() {
   session.setAuthToken(tokenInput.value)
@@ -76,6 +77,13 @@ onMounted(() => {
                 >
                   Log
                 </button>
+                <button
+                  class="rounded-lg px-4 py-2 text-sm font-medium transition-colors"
+                  :class="activeView === 'metadata' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-900'"
+                  @click="activeView = 'metadata'"
+                >
+                  Metadata
+                </button>
               </div>
             </div>
 
@@ -104,8 +112,12 @@ onMounted(() => {
             </section>
           </div>
 
-          <div v-else class="h-full">
+          <div v-else-if="activeView === 'log'" class="h-full">
             <TransportLogView class="h-full" />
+          </div>
+
+          <div v-else class="h-full">
+            <StaticMetadataView class="h-full" />
           </div>
         </main>
       </div>
