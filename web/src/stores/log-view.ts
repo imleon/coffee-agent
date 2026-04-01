@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import type { SessionRuntimeLogEntry, SessionSummary, SessionTransportLogEntry } from '../../../shared/message-types.js'
+import type { SessionChannelLogEntry, SessionRuntimeLogEntry, SessionSummary, SessionTransportLogEntry } from '../../../shared/message-types.js'
 import { createDebugLogger } from '../lib/debug.js'
 import { useSessionStore } from './session'
 
@@ -16,6 +16,12 @@ interface RuntimeLogsResponse {
   nextCursor?: number | null
 }
 
+interface ChannelLogsResponse {
+  items?: SessionChannelLogEntry[]
+  hasMore?: boolean
+  nextCursor?: number | null
+}
+
 const logger = createDebugLogger('log-view-store')
 const SESSION_LIST_REFRESH_INTERVAL_MS = 3000
 
@@ -26,7 +32,7 @@ function shortId(value?: string | null): string | undefined {
 export const useLogViewStore = defineStore('log-view', () => {
   const sessionStore = useSessionStore()
   const selectedSessionId = ref<string | null>(null)
-  const selectedLogTab = ref<'transport' | 'runtime'>('transport')
+  const selectedLogTab = ref<'transport' | 'runtime' | 'channel'>('transport')
   const transportLog = ref<SessionTransportLogEntry[]>([])
   const transportLogHasMore = ref(false)
   const transportLogCursor = ref<number | null>(null)
@@ -40,8 +46,15 @@ export const useLogViewStore = defineStore('log-view', () => {
   const runtimeLogLoading = ref(false)
   const runtimeLogRefreshing = ref(false)
   const runtimeLogFollowing = ref(false)
+  const channelLog = ref<SessionChannelLogEntry[]>([])
+  const channelLogHasMore = ref(false)
+  const channelLogCursor = ref<number | null>(null)
+  const channelLogLoading = ref(false)
+  const channelLogRefreshing = ref(false)
+  const channelLogFollowing = ref(false)
   let transportFollowTimer: number | null = null
   let runtimeFollowTimer: number | null = null
+  let channelFollowTimer: number | null = null
   let sessionListRefreshTimer: number | null = null
 
   const sessions = computed<SessionSummary[]>(() => sessionStore.sessions)
@@ -60,6 +73,14 @@ export const useLogViewStore = defineStore('log-view', () => {
       runtimeFollowTimer = null
     }
     runtimeLogFollowing.value = false
+  }
+
+  function stopChannelFollow() {
+    if (channelFollowTimer !== null) {
+      window.clearTimeout(channelFollowTimer)
+      channelFollowTimer = null
+    }
+    channelLogFollowing.value = false
   }
 
   function stopSessionListRefresh() {
@@ -214,6 +235,58 @@ export const useLogViewStore = defineStore('log-view', () => {
     }
   }
 
+  async function loadChannelLogs(sessionId: string, options: { cursor?: number | null; append?: boolean; follow?: boolean } = {}) {
+    if (!sessionId || channelLogLoading.value) return false
+
+    channelLogLoading.value = true
+    channelLogRefreshing.value = !options.append
+    try {
+      const params = new URLSearchParams()
+      params.set('limit', '100')
+      if (typeof options.cursor === 'number') params.set('cursor', String(options.cursor))
+      if (options.follow) params.set('follow', '1')
+      const res = await apiFetch(`/api/sessions/${sessionId}/channel-logs?${params.toString()}`)
+      if (!res.ok) {
+        logger.warn('channel:load:error', {
+          sessionId: shortId(sessionId),
+          status: res.status,
+          cursor: options.cursor,
+          follow: options.follow,
+        })
+        return false
+      }
+      const data = await res.json() as ChannelLogsResponse
+      const items = Array.isArray(data.items) ? data.items : []
+      if (options.append) {
+        channelLog.value = [...items, ...channelLog.value]
+      } else if (options.follow) {
+        channelLog.value = [...channelLog.value, ...items]
+      } else {
+        channelLog.value = items
+      }
+      channelLogHasMore.value = Boolean(data.hasMore)
+      channelLogCursor.value = typeof data.nextCursor === 'number' ? data.nextCursor : null
+      logger.info('channel:load:success', {
+        sessionId: shortId(sessionId),
+        count: items.length,
+        total: channelLog.value.length,
+        hasMore: channelLogHasMore.value,
+        cursor: channelLogCursor.value,
+        follow: options.follow,
+      })
+      return true
+    } catch (error) {
+      logger.error('channel:load:error', {
+        sessionId: shortId(sessionId),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    } finally {
+      channelLogLoading.value = false
+      channelLogRefreshing.value = false
+    }
+  }
+
   async function reloadTransportLogs() {
     transportLog.value = []
     transportLogHasMore.value = false
@@ -240,6 +313,19 @@ export const useLogViewStore = defineStore('log-view', () => {
     return loaded
   }
 
+  async function reloadChannelLogs() {
+    channelLog.value = []
+    channelLogHasMore.value = false
+    channelLogCursor.value = null
+    stopChannelFollow()
+    if (!selectedSessionId.value) return false
+    const loaded = await loadChannelLogs(selectedSessionId.value)
+    if (loaded && transportLogLive.value) {
+      scheduleChannelFollow()
+    }
+    return loaded
+  }
+
   async function refreshTransportLogs() {
     if (!selectedSessionId.value) return false
     const lastCursor = transportLog.value.length > 0 ? transportLog.value[transportLog.value.length - 1]?.cursor ?? null : null
@@ -252,6 +338,12 @@ export const useLogViewStore = defineStore('log-view', () => {
     return loadRuntimeLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
   }
 
+  async function refreshChannelLogs() {
+    if (!selectedSessionId.value) return false
+    const lastCursor = channelLog.value.length > 0 ? channelLog.value[channelLog.value.length - 1]?.cursor ?? null : null
+    return loadChannelLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
+  }
+
   async function loadOlderTransportLogs() {
     if (!selectedSessionId.value || !transportLogHasMore.value || transportLogCursor.value === null) return false
     return loadTransportLogs(selectedSessionId.value, { cursor: transportLogCursor.value, append: true })
@@ -260,6 +352,11 @@ export const useLogViewStore = defineStore('log-view', () => {
   async function loadOlderRuntimeLogs() {
     if (!selectedSessionId.value || !runtimeLogHasMore.value || runtimeLogCursor.value === null) return false
     return loadRuntimeLogs(selectedSessionId.value, { cursor: runtimeLogCursor.value, append: true })
+  }
+
+  async function loadOlderChannelLogs() {
+    if (!selectedSessionId.value || !channelLogHasMore.value || channelLogCursor.value === null) return false
+    return loadChannelLogs(selectedSessionId.value, { cursor: channelLogCursor.value, append: true })
   }
 
   function scheduleTransportFollow() {
@@ -282,21 +379,34 @@ export const useLogViewStore = defineStore('log-view', () => {
     }, 1500)
   }
 
+  function scheduleChannelFollow() {
+    stopChannelFollow()
+    if (!selectedSessionId.value || !transportLogLive.value) return
+    channelLogFollowing.value = true
+    channelFollowTimer = window.setTimeout(async () => {
+      await refreshChannelLogs()
+      scheduleChannelFollow()
+    }, 1500)
+  }
+
   async function setTransportLive(enabled: boolean) {
     transportLogLive.value = enabled
     if (!enabled) {
       stopTransportFollow()
       stopRuntimeFollow()
+      stopChannelFollow()
       return false
     }
     if (!selectedSessionId.value) return false
-    const [transportLoaded, runtimeLoaded] = await Promise.all([
+    const [transportLoaded, runtimeLoaded, channelLoaded] = await Promise.all([
       refreshTransportLogs(),
       refreshRuntimeLogs(),
+      refreshChannelLogs(),
     ])
     scheduleTransportFollow()
     scheduleRuntimeFollow()
-    return transportLoaded || runtimeLoaded
+    scheduleChannelFollow()
+    return transportLoaded || runtimeLoaded || channelLoaded
   }
 
   async function toggleTransportLive() {
@@ -308,7 +418,7 @@ export const useLogViewStore = defineStore('log-view', () => {
     selectedSessionId.value = sessionId
   }
 
-  function selectLogTab(tab: 'transport' | 'runtime') {
+  function selectLogTab(tab: 'transport' | 'runtime' | 'channel') {
     selectedLogTab.value = tab
   }
 
@@ -317,6 +427,7 @@ export const useLogViewStore = defineStore('log-view', () => {
       await Promise.all([
         reloadTransportLogs(),
         reloadRuntimeLogs(),
+        reloadChannelLogs(),
       ])
     }
   })
@@ -336,6 +447,11 @@ export const useLogViewStore = defineStore('log-view', () => {
     runtimeLogLoading,
     runtimeLogRefreshing,
     runtimeLogFollowing,
+    channelLog,
+    channelLogHasMore,
+    channelLogLoading,
+    channelLogRefreshing,
+    channelLogFollowing,
     ensureSessionsLoaded,
     refreshSessionList,
     startSessionListRefresh,
@@ -344,12 +460,16 @@ export const useLogViewStore = defineStore('log-view', () => {
     selectLogTab,
     reloadTransportLogs,
     reloadRuntimeLogs,
+    reloadChannelLogs,
     refreshTransportLogs,
     refreshRuntimeLogs,
+    refreshChannelLogs,
     loadOlderTransportLogs,
     loadOlderRuntimeLogs,
+    loadOlderChannelLogs,
     stopTransportFollow,
     stopRuntimeFollow,
+    stopChannelFollow,
     setTransportLive,
     toggleTransportLive,
   }

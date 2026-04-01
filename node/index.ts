@@ -4,7 +4,8 @@ import { serveStatic } from '@hono/node-server/serve-static'
 import { Hono } from 'hono'
 import { readFileSync, existsSync } from 'fs'
 import { CONFIG } from './config.js'
-import { createWebRoutes } from './web.js'
+import { startLarkLongConnection } from './lark-adapter.js'
+import { createWebRoutes, coordinator } from './web.js'
 
 const app = new Hono()
 const { injectWebSocket, upgradeWebSocket } = createNodeWebSocket({ app })
@@ -26,3 +27,5 @@ const server = serve({ fetch: app.fetch, port: CONFIG.port, hostname: CONFIG.hos
 })
 
 injectWebSocket(server)
+
+void startLarkLongConnection(coordinator)

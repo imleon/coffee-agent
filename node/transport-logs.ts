@@ -1,7 +1,10 @@
 import { mkdir, appendFile, readFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type {
+  ChannelLogEvent,
   RunnerRuntimeEvent,
+  SessionChannelLogEntry,
+  SessionChannelLogPage,
   SessionRuntimeLogEntry,
   SessionRuntimeLogPage,
   SessionTransportLogEntry,
@@ -10,12 +13,15 @@ import type {
 } from '../shared/message-types.js'
 import { sanitizeValue } from './logger.js'
 
-const TRANSPORT_LOG_DIR = './data/transport-logs'
-const RUNTIME_LOG_DIR = './data/runtime-logs'
+const LOG_DIR = './data/logs'
+const LEGACY_TRANSPORT_LOG_DIR = './data/transport-logs'
+const LEGACY_RUNTIME_LOG_DIR = './data/runtime-logs'
 const DEFAULT_TRANSPORT_PAGE_SIZE = 100
 const DEFAULT_RUNTIME_PAGE_SIZE = 100
+const DEFAULT_CHANNEL_PAGE_SIZE = 100
 const MAX_TRANSPORT_PAGE_SIZE = 200
 const MAX_RUNTIME_PAGE_SIZE = 200
+const MAX_CHANNEL_PAGE_SIZE = 200
 
 type StoredTransportLogRecord = {
   runId: string
@@ -29,12 +35,25 @@ type StoredRuntimeLogRecord = {
   event: RunnerRuntimeEvent
 }
 
-function getTransportLogFilePath(sessionId: string): string {
-  return join(TRANSPORT_LOG_DIR, `${sessionId}.ndjson`)
+type StoredChannelLogRecord = {
+  runId?: string
+  loggedAt: number
+  sessionId: string
+  event: ChannelLogEvent
 }
 
-function getRuntimeLogFilePath(sessionId: string): string {
-  return join(RUNTIME_LOG_DIR, `${sessionId}.ndjson`)
+type LogFileKind = 'transport' | 'runtime' | 'channel'
+
+function getLogFilePath(sessionId: string, kind: LogFileKind): string {
+  return join(LOG_DIR, `${sessionId}.${kind}.ndjson`)
+}
+
+function getLegacyTransportLogFilePath(sessionId: string): string {
+  return join(LEGACY_TRANSPORT_LOG_DIR, `${sessionId}.ndjson`)
+}
+
+function getLegacyRuntimeLogFilePath(sessionId: string): string {
+  return join(LEGACY_RUNTIME_LOG_DIR, `${sessionId}.ndjson`)
 }
 
 function sanitizeSessionId(sessionId: string): string | null {
@@ -46,6 +65,14 @@ function normalizeTransportPayload(event: SdkTransportEvent): SdkTransportEvent 
   return {
     ...event,
     payload: sanitizeValue(event.payload),
+  }
+}
+
+function sanitizeChannelEvent(event: ChannelLogEvent): ChannelLogEvent {
+  return {
+    ...event,
+    ...(event.payloadSummary ? { payloadSummary: String(sanitizeValue(event.payloadSummary)) } : {}),
+    ...(event.payload !== undefined ? { payload: sanitizeValue(event.payload) } : {}),
   }
 }
 
@@ -81,12 +108,64 @@ function getRuntimeEventSessionId(event: RunnerRuntimeEvent): string | null {
   return typeof event.sessionId === 'string' ? sanitizeSessionId(event.sessionId) : null
 }
 
+async function appendLogRecord(filePath: string, record: unknown): Promise<void> {
+  await mkdir(dirname(filePath), { recursive: true })
+  await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf-8')
+}
+
+async function readFirstExistingLogFile(filePaths: string[]): Promise<string | null> {
+  for (const filePath of filePaths) {
+    try {
+      return await readFile(filePath, 'utf-8')
+    } catch (error) {
+      const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code) : ''
+      if (code === 'ENOENT') continue
+      throw error
+    }
+  }
+  return null
+}
+
+function paginateLogLines<T>(
+  content: string,
+  cursor: number | null | undefined,
+  limit: number,
+  follow: boolean,
+  parseLine: (line: string, cursor: number) => T | null,
+): { items: T[]; hasMore: boolean; nextCursor: number | null } {
+  const lines = content.split('\n')
+  if (lines.length > 0 && lines[lines.length - 1] === '') {
+    lines.pop()
+  }
+
+  const total = lines.length
+  const boundedCursor = typeof cursor === 'number' && Number.isFinite(cursor)
+    ? Math.max(0, Math.min(total, Math.floor(cursor)))
+    : null
+  const endExclusive = follow
+    ? total
+    : boundedCursor ?? total
+  const start = follow
+    ? (boundedCursor ?? total)
+    : Math.max(0, endExclusive - limit)
+  const items: T[] = []
+
+  for (let index = start; index < endExclusive; index += 1) {
+    const entry = parseLine(lines[index] || '', index + 1)
+    if (entry) items.push(entry)
+  }
+
+  return {
+    items,
+    hasMore: follow ? false : start > 0,
+    nextCursor: items.length > 0 ? endExclusive : boundedCursor ?? total,
+  }
+}
+
 export async function appendSessionTransportLog(runId: string, event: SdkTransportEvent): Promise<void> {
   const sessionId = typeof event.sessionId === 'string' ? sanitizeSessionId(event.sessionId) : null
   if (!sessionId) return
 
-  const filePath = getTransportLogFilePath(sessionId)
-  await mkdir(dirname(filePath), { recursive: true })
   const record: StoredTransportLogRecord = {
     runId,
     event: {
@@ -94,22 +173,37 @@ export async function appendSessionTransportLog(runId: string, event: SdkTranspo
       sessionId,
     },
   }
-  await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf-8')
+  await appendLogRecord(getLogFilePath(sessionId, 'transport'), record)
 }
 
 export async function appendSessionRuntimeLog(runId: string, event: RunnerRuntimeEvent): Promise<void> {
   const sessionId = getRuntimeEventSessionId(event)
   if (!sessionId) return
 
-  const filePath = getRuntimeLogFilePath(sessionId)
-  await mkdir(dirname(filePath), { recursive: true })
   const record: StoredRuntimeLogRecord = {
     runId,
     loggedAt: Date.now(),
     sessionId,
     event: sanitizeRuntimeEvent(event),
   }
-  await appendFile(filePath, `${JSON.stringify(record)}\n`, 'utf-8')
+  await appendLogRecord(getLogFilePath(sessionId, 'runtime'), record)
+}
+
+export async function appendSessionChannelLog(
+  sessionId: string,
+  event: ChannelLogEvent,
+  runId?: string,
+): Promise<void> {
+  const safeSessionId = sanitizeSessionId(sessionId)
+  if (!safeSessionId) return
+
+  const record: StoredChannelLogRecord = {
+    ...(runId ? { runId } : {}),
+    loggedAt: Date.now(),
+    sessionId: safeSessionId,
+    event: sanitizeChannelEvent(event),
+  }
+  await appendLogRecord(getLogFilePath(safeSessionId, 'channel'), record)
 }
 
 function parseTransportLogLine(line: string, cursor: number): SessionTransportLogEntry | null {
@@ -158,6 +252,30 @@ function parseRuntimeLogLine(line: string, cursor: number): SessionRuntimeLogEnt
   }
 }
 
+function parseChannelLogLine(line: string, cursor: number): SessionChannelLogEntry | null {
+  if (!line.trim()) return null
+  try {
+    const parsed = JSON.parse(line) as Partial<StoredChannelLogRecord>
+    if (!parsed || typeof parsed !== 'object') return null
+    if (typeof parsed.loggedAt !== 'number' || !Number.isFinite(parsed.loggedAt)) return null
+    if (typeof parsed.sessionId !== 'string' || !sanitizeSessionId(parsed.sessionId)) return null
+    if (!parsed.event || typeof parsed.event !== 'object') return null
+    const event = parsed.event as ChannelLogEvent
+    if (event.source !== 'channel' || typeof event.eventName !== 'string') return null
+    if (event.channel !== 'web' && event.channel !== 'lark' && event.channel !== 'discord') return null
+    if (event.direction !== 'inbound' && event.direction !== 'outbound' && event.direction !== 'internal') return null
+    return {
+      cursor,
+      ...(typeof parsed.runId === 'string' ? { runId: parsed.runId } : {}),
+      loggedAt: parsed.loggedAt,
+      sessionId: parsed.sessionId,
+      event,
+    }
+  } catch {
+    return null
+  }
+}
+
 export async function readSessionTransportLogs(
   sessionId: string,
   cursor?: number | null,
@@ -170,46 +288,15 @@ export async function readSessionTransportLogs(
   }
 
   const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_TRANSPORT_PAGE_SIZE, Math.floor(limit))) : DEFAULT_TRANSPORT_PAGE_SIZE
-  const filePath = getTransportLogFilePath(safeSessionId)
-
-  let content = ''
-  try {
-    content = await readFile(filePath, 'utf-8')
-  } catch (error) {
-    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code) : ''
-    if (code === 'ENOENT') {
-      return { items: [], hasMore: false, nextCursor: null }
-    }
-    throw error
+  const content = await readFirstExistingLogFile([
+    getLogFilePath(safeSessionId, 'transport'),
+    getLegacyTransportLogFilePath(safeSessionId),
+  ])
+  if (content === null) {
+    return { items: [], hasMore: false, nextCursor: null }
   }
 
-  const lines = content.split('\n')
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
-  }
-
-  const total = lines.length
-  const boundedCursor = typeof cursor === 'number' && Number.isFinite(cursor)
-    ? Math.max(0, Math.min(total, Math.floor(cursor)))
-    : null
-  const endExclusive = follow
-    ? total
-    : boundedCursor ?? total
-  const start = follow
-    ? (boundedCursor ?? total)
-    : Math.max(0, endExclusive - safeLimit)
-  const items: SessionTransportLogEntry[] = []
-
-  for (let index = start; index < endExclusive; index += 1) {
-    const entry = parseTransportLogLine(lines[index] || '', index + 1)
-    if (entry) items.push(entry)
-  }
-
-  return {
-    items,
-    hasMore: follow ? false : start > 0,
-    nextCursor: items.length > 0 ? items[items.length - 1]!.cursor : boundedCursor ?? total,
-  }
+  return paginateLogLines(content, cursor, safeLimit, follow, parseTransportLogLine)
 }
 
 export async function readSessionRuntimeLogs(
@@ -224,44 +311,35 @@ export async function readSessionRuntimeLogs(
   }
 
   const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_RUNTIME_PAGE_SIZE, Math.floor(limit))) : DEFAULT_RUNTIME_PAGE_SIZE
-  const filePath = getRuntimeLogFilePath(safeSessionId)
-
-  let content = ''
-  try {
-    content = await readFile(filePath, 'utf-8')
-  } catch (error) {
-    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code) : ''
-    if (code === 'ENOENT') {
-      return { items: [], hasMore: false, nextCursor: null }
-    }
-    throw error
+  const content = await readFirstExistingLogFile([
+    getLogFilePath(safeSessionId, 'runtime'),
+    getLegacyRuntimeLogFilePath(safeSessionId),
+  ])
+  if (content === null) {
+    return { items: [], hasMore: false, nextCursor: null }
   }
 
-  const lines = content.split('\n')
-  if (lines.length > 0 && lines[lines.length - 1] === '') {
-    lines.pop()
+  return paginateLogLines(content, cursor, safeLimit, follow, parseRuntimeLogLine)
+}
+
+export async function readSessionChannelLogs(
+  sessionId: string,
+  cursor?: number | null,
+  limit: number = DEFAULT_CHANNEL_PAGE_SIZE,
+  follow: boolean = false,
+): Promise<SessionChannelLogPage> {
+  const safeSessionId = sanitizeSessionId(sessionId)
+  if (!safeSessionId) {
+    return { items: [], hasMore: false, nextCursor: null }
   }
 
-  const total = lines.length
-  const boundedCursor = typeof cursor === 'number' && Number.isFinite(cursor)
-    ? Math.max(0, Math.min(total, Math.floor(cursor)))
-    : null
-  const endExclusive = follow
-    ? total
-    : boundedCursor ?? total
-  const start = follow
-    ? (boundedCursor ?? total)
-    : Math.max(0, endExclusive - safeLimit)
-  const items: SessionRuntimeLogEntry[] = []
-
-  for (let index = start; index < endExclusive; index += 1) {
-    const entry = parseRuntimeLogLine(lines[index] || '', index + 1)
-    if (entry) items.push(entry)
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_CHANNEL_PAGE_SIZE, Math.floor(limit))) : DEFAULT_CHANNEL_PAGE_SIZE
+  const content = await readFirstExistingLogFile([
+    getLogFilePath(safeSessionId, 'channel'),
+  ])
+  if (content === null) {
+    return { items: [], hasMore: false, nextCursor: null }
   }
 
-  return {
-    items,
-    hasMore: follow ? false : start > 0,
-    nextCursor: items.length > 0 ? items[items.length - 1]!.cursor : boundedCursor ?? total,
-  }
+  return paginateLogLines(content, cursor, safeLimit, follow, parseChannelLogLine)
 }

@@ -6,7 +6,12 @@ import { stringifyStructuredValue } from '../../../shared/transcript-normalizer.
 const logView = useLogViewStore()
 const transportItems = computed(() => logView.transportLog)
 const runtimeItems = computed(() => logView.runtimeLog.filter((item) => item.event.type !== 'sdk.transport'))
-const activeItems = computed(() => logView.selectedLogTab === 'transport' ? transportItems.value : runtimeItems.value)
+const channelItems = computed(() => logView.channelLog)
+const activeItems = computed(() => {
+  if (logView.selectedLogTab === 'transport') return transportItems.value
+  if (logView.selectedLogTab === 'runtime') return runtimeItems.value
+  return channelItems.value
+})
 const sortedSessions = computed(() => (
   [...logView.sessions].sort((left, right) => {
     const leftTime = typeof left.updatedAt === 'number' && Number.isFinite(left.updatedAt) ? left.updatedAt : 0
@@ -141,6 +146,23 @@ function getRuntimePayload(item: { event: Record<string, unknown> }): unknown {
   return item.event
 }
 
+function getChannelDirectionClass(direction: string): string {
+  if (direction === 'inbound') return 'border-emerald-200 bg-emerald-50 text-emerald-700'
+  if (direction === 'outbound') return 'border-violet-200 bg-violet-50 text-violet-700'
+  return 'border-amber-200 bg-amber-50 text-amber-700'
+}
+
+function getChannelEventClass(eventName: string): string {
+  if (eventName.includes('message')) return 'border-sky-200 bg-sky-50 text-sky-700'
+  if (eventName.includes('permission') || eventName.includes('elicitation') || eventName.includes('card-action')) return 'border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700'
+  if (eventName.includes('run')) return 'border-amber-200 bg-amber-50 text-amber-700'
+  return 'border-gray-200 bg-gray-100 text-gray-700'
+}
+
+function getChannelPayload(item: { event: Record<string, unknown> }): unknown {
+  return item.event.payload ?? item.event
+}
+
 const liveButtonClass = computed(() => (
   logView.transportLogLive
     ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
@@ -149,7 +171,7 @@ const liveButtonClass = computed(() => (
 
 const liveButtonLabel = computed(() => {
   if (logView.transportLogLive) {
-    return (logView.transportLogRefreshing || logView.runtimeLogRefreshing) ? 'LIVE · SYNCING' : 'LIVE'
+    return (logView.transportLogRefreshing || logView.runtimeLogRefreshing || logView.channelLogRefreshing) ? 'LIVE · SYNCING' : 'LIVE'
   }
   return 'PAUSED'
 })
@@ -166,8 +188,10 @@ async function handleScroll() {
   if (!container || container.scrollTop > 120) return
   if (logView.selectedLogTab === 'transport') {
     if (!logView.transportLogHasMore || logView.transportLogLoading) return
-  } else {
+  } else if (logView.selectedLogTab === 'runtime') {
     if (!logView.runtimeLogHasMore || logView.runtimeLogLoading) return
+  } else {
+    if (!logView.channelLogHasMore || logView.channelLogLoading) return
   }
 
   preservingOlderScroll.value = true
@@ -175,7 +199,9 @@ async function handleScroll() {
   const previousTop = container.scrollTop
   const loaded = logView.selectedLogTab === 'transport'
     ? await logView.loadOlderTransportLogs()
-    : await logView.loadOlderRuntimeLogs()
+    : logView.selectedLogTab === 'runtime'
+      ? await logView.loadOlderRuntimeLogs()
+      : await logView.loadOlderChannelLogs()
   if (!loaded) {
     preservingOlderScroll.value = false
     return
@@ -219,6 +245,7 @@ onMounted(() => {
       void Promise.all([
         logView.reloadTransportLogs(),
         logView.reloadRuntimeLogs(),
+        logView.reloadChannelLogs(),
       ])
     }
   })
@@ -228,6 +255,7 @@ onBeforeUnmount(() => {
   logView.stopSessionListRefresh()
   logView.stopTransportFollow()
   logView.stopRuntimeFollow()
+  logView.stopChannelFollow()
 })
 </script>
 
@@ -236,7 +264,7 @@ onBeforeUnmount(() => {
     <div class="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col gap-2">
       <div class="border-b border-gray-200 pb-2">
         <h2 class="text-sm font-semibold text-gray-900">SDK logs</h2>
-        <p class="mt-0.5 text-[11px] text-gray-500">同一 session 下可切换查看 transport 结构化日志与完整 runtime 日志。</p>
+        <p class="mt-0.5 text-[11px] text-gray-500">同一 session 下可切换查看 transport、runtime 与 channel 日志。</p>
       </div>
 
       <div class="flex items-center justify-between gap-2 pb-1">
@@ -266,6 +294,13 @@ onBeforeUnmount(() => {
             >
               Runtime
             </button>
+            <button
+              class="rounded px-2 py-1"
+              :class="logView.selectedLogTab === 'channel' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-100'"
+              @click="logView.selectLogTab('channel')"
+            >
+              Channel
+            </button>
           </div>
           <div class="truncate text-[11px] text-gray-500">
             <span class="text-gray-400">session:</span>
@@ -275,7 +310,7 @@ onBeforeUnmount(() => {
         <button
           class="rounded border px-2 py-1 text-[11px] font-semibold tracking-wide disabled:cursor-not-allowed disabled:opacity-50"
           :class="liveButtonClass"
-          :disabled="!logView.selectedSessionId || (logView.selectedLogTab === 'transport' ? logView.transportLogLoading : logView.runtimeLogLoading)"
+          :disabled="!logView.selectedSessionId || (logView.selectedLogTab === 'transport' ? logView.transportLogLoading : logView.selectedLogTab === 'runtime' ? logView.runtimeLogLoading : logView.channelLogLoading)"
           @click="logView.toggleTransportLive"
         >
           {{ liveButtonLabel }}
@@ -334,7 +369,7 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <template v-else>
+        <template v-else-if="logView.selectedLogTab === 'runtime'">
           <div v-if="runtimeItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
             No runtime logs yet.
           </div>
@@ -369,6 +404,49 @@ onBeforeUnmount(() => {
                 <details class="mt-1 rounded border border-gray-200 bg-gray-50/70 px-2 py-1">
                   <summary class="cursor-pointer text-gray-600 hover:text-gray-800">Payload</summary>
                   <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(getRuntimePayload(item)) }}</pre>
+                </details>
+              </div>
+            </div>
+          </div>
+        </template>
+
+        <template v-else>
+          <div v-if="channelItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
+            No channel logs yet.
+          </div>
+
+          <div v-else ref="scrollContainer" class="h-full overflow-auto" @scroll="handleScroll">
+            <div class="sticky top-0 z-10 grid grid-cols-[28ch_10ch_18ch_16ch_20ch_minmax(28ch,1fr)] gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2 text-[10px] uppercase tracking-wide text-gray-500">
+              <div>Time</div>
+              <div>Dir</div>
+              <div>Channel Event</div>
+              <div>Run ID</div>
+              <div>Conversation</div>
+              <div>Details</div>
+            </div>
+            <div
+              v-for="item in channelItems"
+              :key="`channel-${item.sessionId}-${item.cursor}`"
+              class="grid grid-cols-[28ch_10ch_18ch_16ch_20ch_minmax(28ch,1fr)] gap-3 border-b border-gray-100 px-3 py-2 text-[11px] leading-5 transition-colors last:border-b-0 hover:bg-gray-50"
+            >
+              <div class="shrink-0 whitespace-nowrap text-gray-500">{{ formatTimestamp(item.loggedAt) }}</div>
+              <div>
+                <span class="inline-flex min-w-[4ch] justify-center rounded border px-1.5 py-0 font-medium" :class="getChannelDirectionClass(item.event.direction)">
+                  {{ item.event.direction.toUpperCase() }}
+                </span>
+              </div>
+              <div class="min-w-0">
+                <span class="inline-flex whitespace-nowrap rounded border px-1.5 py-0 font-medium align-top" :class="getChannelEventClass(item.event.eventName)">
+                  {{ item.event.eventName }}
+                </span>
+              </div>
+              <div class="shrink-0 text-gray-400">{{ item.runId ? item.runId.slice(0, 8) : '-' }}</div>
+              <div class="truncate text-gray-500">{{ item.event.conversationKey || '-' }}</div>
+              <div class="min-w-0">
+                <div class="truncate text-gray-700">{{ item.event.payloadSummary || '-' }}</div>
+                <details v-if="item.event.payload !== undefined" class="mt-1 rounded border border-gray-200 bg-gray-50/70 px-2 py-1">
+                  <summary class="cursor-pointer text-gray-600 hover:text-gray-800">Payload</summary>
+                  <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(getChannelPayload(item)) }}</pre>
                 </details>
               </div>
             </div>

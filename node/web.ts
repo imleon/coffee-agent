@@ -1,4 +1,4 @@
-import { randomUUID, timingSafeEqual } from 'node:crypto'
+import { timingSafeEqual } from 'node:crypto'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { dirname, resolve } from 'node:path'
@@ -6,29 +6,22 @@ import { fileURLToPath } from 'node:url'
 import { Hono } from 'hono'
 import { cors } from 'hono/cors'
 import type { UpgradeWebSocket } from 'hono/ws'
+import { createWebSocketHandler } from './channels-web-adapter.js'
+import { createLarkOutboundMessage, deliverLarkSessionEvent, invokeLarkCardAction, invokeLarkEvent, sendLarkTextMessage } from './lark-adapter.js'
 import { CONFIG } from './config.js'
-import { createAgentRun, type AgentRunHandle, type ServerEvent } from './agent-runner.js'
-import type { SessionEvent, StaticMetadataSnapshot, StaticMetadataTreeNode } from '../shared/message-types.js'
-import { TaskQueue } from './queue.js'
+import { RunCoordinator } from './run-coordinator.js'
+import type { StaticMetadataSnapshot, StaticMetadataTreeNode } from '../shared/message-types.js'
 import { listAllSessions, getMessages } from './sessions.js'
-import { readSessionRuntimeLogs, readSessionTransportLogs } from './transport-logs.js'
+import { appendSessionChannelLog, readSessionChannelLogs, readSessionRuntimeLogs, readSessionTransportLogs } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
 import { buildSdkExportTree, mapTree, overlayNodeValues } from './sdk-type-tree.js'
 
-const queue = new TaskQueue(CONFIG.maxConcurrentAgents)
 const logger = createLogger('web')
-const EVENT_LOG_INTERVAL = 20
+export const coordinator = new RunCoordinator()
 
-type PermissionDecision = 'approve' | 'deny'
-type ElicitationAction = 'accept' | 'decline' | 'cancel'
-
-type ActiveRunState = {
-  runId: string
-  handle: AgentRunHandle | null
-  abortController: AbortController
-  canceled: boolean
-  sessionId?: string
-}
+coordinator.subscribe('lark-outbound-observer', (event, record) => {
+  void deliverLarkSessionEvent(event, record)
+})
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const SDK_DIR = resolve(ROOT_DIR, 'node_modules/@anthropic-ai/claude-agent-sdk')
@@ -38,6 +31,34 @@ const USER_STATE_PATH = resolve(homedir(), '.claude.json')
 const SDK_PACKAGE_JSON_PATH = resolve(SDK_DIR, 'package.json')
 const SDK_MANIFEST_JSON_PATH = resolve(SDK_DIR, 'manifest.json')
 const SDK_DTS_PATH = resolve(SDK_DIR, 'sdk.d.ts')
+
+function isSafeSessionId(value: unknown): value is string {
+  return typeof value === 'string' && /^[a-zA-Z0-9._-]+$/.test(value)
+}
+
+async function writeChannelLog(params: {
+  sessionId?: string
+  runId?: string
+  channel: 'web' | 'lark' | 'discord'
+  direction: 'inbound' | 'outbound' | 'internal'
+  eventName: string
+  conversationKey?: string
+  platformMessageId?: string
+  payloadSummary?: string
+  payload?: unknown
+}): Promise<void> {
+  if (!isSafeSessionId(params.sessionId)) return
+  await appendSessionChannelLog(params.sessionId, {
+    source: 'channel',
+    channel: params.channel,
+    direction: params.direction,
+    eventName: params.eventName,
+    ...(params.conversationKey ? { conversationKey: params.conversationKey } : {}),
+    ...(params.platformMessageId ? { platformMessageId: params.platformMessageId } : {}),
+    ...(params.payloadSummary ? { payloadSummary: params.payloadSummary } : {}),
+    ...(params.payload !== undefined ? { payload: params.payload } : {}),
+  }, params.runId)
+}
 
 function createNode(input: {
   key: string
@@ -361,22 +382,15 @@ function getBearerToken(header?: string | null): string | null {
   return header.startsWith(prefix) ? header.slice(prefix.length).trim() : null
 }
 
-function sendSocketEvent(ws: any, payload: unknown) {
-  try {
-    ws.send(JSON.stringify(payload))
-  } catch (error) {
-    logger.error('ws:send:error', {
-      error: error instanceof Error ? error.message : String(error),
-    })
+function getLarkConfigStatus() {
+  return {
+    configured: Boolean(CONFIG.lark.appId && CONFIG.lark.appSecret),
+    hasAppId: Boolean(CONFIG.lark.appId),
+    hasAppSecret: Boolean(CONFIG.lark.appSecret),
+    hasEncryptKey: Boolean(CONFIG.lark.encryptKey),
+    hasVerificationToken: Boolean(CONFIG.lark.verificationToken),
+    botName: CONFIG.lark.botName,
   }
-}
-
-function sendSessionEvent(ws: any, event: SessionEvent) {
-  sendSocketEvent(ws, event)
-}
-
-function toSessionEvent(event: ServerEvent): SessionEvent {
-  return event
 }
 
 export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
@@ -385,7 +399,12 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
   app.use('*', cors())
 
   app.use('/api/*', async (c, next) => {
-    if (c.req.path === '/api/health' || !CONFIG.authEnabled) {
+    if (
+      c.req.path === '/api/health'
+      || c.req.path === '/api/channels/lark/inbound'
+      || c.req.path === '/api/channels/lark/card-action'
+      || !CONFIG.authEnabled
+    ) {
       await next()
       return
     }
@@ -405,6 +424,103 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
   app.get('/api/health', (c) => {
     logger.debug('http:health', { authEnabled: CONFIG.authEnabled })
     return c.json({ status: 'ok', authEnabled: CONFIG.authEnabled })
+  })
+
+  app.get('/api/channels/lark', (c) => {
+    return c.json(getLarkConfigStatus())
+  })
+
+  app.post('/api/channels/lark/inbound', async (c) => {
+    try {
+      const body = await c.req.json()
+      const headers = Object.fromEntries(c.req.raw.headers.entries())
+      const result = await invokeLarkEvent(coordinator, body, headers)
+      return c.json(result ?? { ok: true })
+    } catch (error) {
+      logger.error('http:lark:inbound:error', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return c.json({ error: 'Invalid Lark inbound payload' }, 400)
+    }
+  })
+
+  app.post('/api/channels/lark/card-action', async (c) => {
+    try {
+      const body = await c.req.json()
+      const headers = Object.fromEntries(c.req.raw.headers.entries())
+      const bodyRecord = body && typeof body === 'object' ? body as Record<string, unknown> : null
+      const openMessageId = typeof bodyRecord?.open_message_id === 'string' ? bodyRecord.open_message_id : undefined
+      const action = bodyRecord?.action && typeof bodyRecord.action === 'object' ? bodyRecord.action as Record<string, unknown> : null
+      const actionValue = action?.value && typeof action.value === 'object' ? action.value as Record<string, unknown> : null
+      const sessionId = typeof actionValue?.sessionId === 'string' ? actionValue.sessionId : undefined
+      const runId = typeof actionValue?.runId === 'string' ? actionValue.runId : undefined
+      await writeChannelLog({
+        sessionId,
+        runId,
+        channel: 'lark',
+        direction: 'inbound',
+        eventName: 'card-action.received',
+        platformMessageId: openMessageId,
+        payloadSummary: typeof actionValue?.actionType === 'string' ? actionValue.actionType : 'card-action',
+        payload: {
+          openMessageId,
+          actionType: actionValue?.actionType,
+          decision: actionValue?.decision,
+        },
+      })
+      const result = await invokeLarkCardAction(coordinator, body, headers)
+      return c.json(result ?? { ok: true })
+    } catch (error) {
+      logger.error('http:lark:card-action:error', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return c.json({ error: 'Invalid Lark card action payload' }, 400)
+    }
+  })
+
+  app.post('/api/channels/lark/outbound', async (c) => {
+    try {
+      const body = await c.req.json()
+      const record = body && typeof body === 'object' ? body as Record<string, unknown> : null
+      const conversationKey = typeof record?.conversationKey === 'string' && record.conversationKey.trim()
+        ? record.conversationKey.trim()
+        : null
+      const content = typeof record?.content === 'string' ? record.content.trim() : ''
+      const runId = typeof record?.runId === 'string' && record.runId.trim() ? record.runId.trim() : 'manual'
+      const sessionId = typeof record?.sessionId === 'string' && record.sessionId.trim() ? record.sessionId.trim() : undefined
+
+      if (!conversationKey || !content) {
+        return c.json({ error: 'conversationKey and content are required' }, 400)
+      }
+
+      const message = createLarkOutboundMessage(runId, sessionId, conversationKey, content)
+      await writeChannelLog({
+        sessionId: message.sessionId,
+        runId: message.runId,
+        channel: 'lark',
+        direction: 'outbound',
+        eventName: 'message.requested',
+        conversationKey: message.conversationKey,
+        payloadSummary: message.content,
+      })
+      const delivery = await sendLarkTextMessage(message.conversationKey, message.content)
+      await writeChannelLog({
+        sessionId: message.sessionId,
+        runId: message.runId,
+        channel: 'lark',
+        direction: 'outbound',
+        eventName: delivery.delivered ? 'message.delivered' : 'message.failed',
+        conversationKey: message.conversationKey,
+        payloadSummary: delivery.delivered ? 'delivered' : (delivery.error || 'failed'),
+        payload: delivery,
+      })
+      return c.json({ ...delivery, message })
+    } catch (error) {
+      logger.error('http:lark:outbound:error', {
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return c.json({ error: 'Invalid Lark outbound payload' }, 400)
+    }
   })
 
   app.get('/api/sessions', async (c) => {
@@ -485,6 +601,25 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
     }
   })
 
+  app.get('/api/sessions/:id/channel-logs', async (c) => {
+    const startedAt = Date.now()
+    try {
+      const id = c.req.param('id')
+      const limit = parseInt(c.req.query('limit') || '100', 10)
+      const cursorRaw = c.req.query('cursor')
+      const follow = c.req.query('follow') === '1'
+      const cursor = cursorRaw ? parseInt(cursorRaw, 10) : null
+      const page = await readSessionChannelLogs(id, Number.isFinite(cursor) ? cursor : null, limit, follow)
+      return c.json(page)
+    } catch (err) {
+      logger.error('http:channel-logs:error', {
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      })
+      return c.json({ items: [], hasMore: false, nextCursor: null, error: String(err) })
+    }
+  })
+
   app.get('/api/static-metadata', async (c) => {
     const startedAt = Date.now()
     try {
@@ -515,252 +650,7 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
     await next()
   })
 
-  app.get('/ws', upgradeWebSocket(() => {
-    let activeRun: ActiveRunState | null = null
-    const connId = shortId(randomUUID())
-    let forwardedEvents = 0
-
-    logger.info('ws:connect', { connId })
-
-    return {
-      onMessage(evt, ws) {
-        try {
-          const raw = typeof evt.data === 'string' ? evt.data : ''
-          const data = JSON.parse(raw)
-          logger.info('ws:message:received', {
-            connId,
-            action: typeof data.action === 'string' ? data.action : '(unknown)',
-            promptLength: typeof data.prompt === 'string' ? data.prompt.length : undefined,
-            sessionId: typeof data.sessionId === 'string' ? shortId(data.sessionId) : undefined,
-          })
-          if (data.action === 'message.create' && data.prompt) {
-            if (activeRun?.canceled) activeRun = null
-            if (activeRun) {
-              logger.warn('run:rejected:active-run', {
-                connId,
-                runId: shortId(activeRun.runId),
-              })
-              sendSessionEvent(ws, { type: 'session.error', runId: activeRun.runId, error: 'Another run is already active' })
-              return
-            }
-            activeRun = handleMessageCreate(ws, connId || 'ws', data.prompt, data.sessionId, (next) => {
-              activeRun = next
-            }, (count) => {
-              forwardedEvents = count
-            })
-            return
-          }
-
-          if (data.action === 'permission.respond' && data.runId && typeof data.permissionId === 'string' && (data.decision === 'approve' || data.decision === 'deny')) {
-            handlePermission(ws, activeRun, data.runId, data.permissionId, data.decision)
-            return
-          }
-
-          if (data.action === 'elicitation.respond' && data.runId && data.requestId && (data.responseAction === 'accept' || data.responseAction === 'decline' || data.responseAction === 'cancel')) {
-            handleElicitation(ws, activeRun, data.runId, data.requestId, data.responseAction, data.content)
-            return
-          }
-
-          if (data.action === 'run.cancel') {
-            logger.warn('run:cancel:requested', {
-              connId,
-              runId: shortId(activeRun?.runId),
-            })
-            if (activeRun) {
-              activeRun.canceled = true
-              activeRun.abortController.abort()
-              if (activeRun.handle) {
-                activeRun.handle.cancel()
-              } else {
-                sendSessionEvent(ws, { type: 'session.run.cancelled', runId: activeRun.runId })
-                sendSessionEvent(ws, { type: 'session.run.state_changed', runId: activeRun.runId, state: 'cancelled' })
-                activeRun = null
-              }
-            }
-            return
-          }
-
-          logger.warn('ws:message:unsupported-action', {
-            connId,
-            action: typeof data.action === 'string' ? data.action : '(unknown)',
-          })
-        } catch (error) {
-          logger.warn('ws:message:invalid-json', {
-            connId,
-            error: error instanceof Error ? error.message : String(error),
-          })
-          sendSessionEvent(ws, { type: 'session.error', error: 'Invalid message' })
-        }
-      },
-      onClose() {
-        logger.info('ws:close', {
-          connId,
-          runId: shortId(activeRun?.runId),
-          forwardedEvents,
-        })
-        if (activeRun) {
-          activeRun.canceled = true
-          activeRun.abortController.abort()
-          activeRun.handle?.cancel()
-        }
-        activeRun = null
-      },
-    }
-  }))
+  app.get('/ws', createWebSocketHandler(upgradeWebSocket, coordinator))
 
   return app
-}
-
-function handlePermission(ws: any, activeRun: ActiveRunState | null, runId: string, permissionId: string, decision: PermissionDecision) {
-  if (!activeRun || activeRun.runId !== runId || !activeRun.handle) {
-    logger.warn('run:permission:missing-active-run', {
-      runId: shortId(runId),
-      permissionId: shortId(permissionId),
-    })
-    sendSessionEvent(ws, { type: 'session.error', runId, error: 'No matching active run for permission response' })
-    return
-  }
-  logger.info('run:permission:respond', {
-    runId: shortId(runId),
-    permissionId: shortId(permissionId),
-    decision,
-  })
-  activeRun.handle.respondToPermission(permissionId, decision)
-}
-
-function handleElicitation(ws: any, activeRun: ActiveRunState | null, runId: string, requestId: string, action: ElicitationAction, content: unknown) {
-  if (!activeRun || activeRun.runId !== runId || !activeRun.handle) {
-    logger.warn('run:elicitation:missing-active-run', {
-      runId: shortId(runId),
-      requestId: shortId(requestId),
-    })
-    sendSessionEvent(ws, { type: 'session.error', runId, error: 'No matching active run for elicitation response' })
-    return
-  }
-
-  if (content !== undefined && (typeof content !== 'object' || content === null || Array.isArray(content))) {
-    logger.warn('run:elicitation:invalid-content', {
-      runId: shortId(runId),
-      requestId: shortId(requestId),
-    })
-    sendSessionEvent(ws, { type: 'session.error', runId, error: 'Elicitation content must be an object' })
-    return
-  }
-
-  logger.info('run:elicitation:respond', {
-    runId: shortId(runId),
-    requestId: shortId(requestId),
-    action,
-  })
-  activeRun.handle.respondToElicitation(requestId, {
-    action,
-    ...(content && typeof content === 'object' && !Array.isArray(content) ? { content: content as Record<string, string | number | boolean | string[]> } : {}),
-  })
-}
-
-function handleMessageCreate(
-  ws: any,
-  connId: string,
-  prompt: string,
-  sessionId: string | undefined,
-  setActiveRun: (value: ActiveRunState | null) => void,
-  setForwardedEvents: (count: number) => void,
-): ActiveRunState {
-  const runId = randomUUID()
-  const startedAt = Date.now()
-  const abortController = new AbortController()
-  const state: ActiveRunState = { runId, handle: null, abortController, canceled: false, ...(sessionId ? { sessionId } : {}) }
-  let forwardedEvents = 0
-
-  logger.info('run:queued', {
-    connId,
-    runId: shortId(runId),
-    sessionId: shortId(sessionId),
-    promptLength: prompt.length,
-    queuePending: queue.pending,
-    queueActive: queue.active,
-  })
-  sendSessionEvent(ws, { type: 'session.run.queued', runId, ...(sessionId ? { sessionId } : {}) })
-  sendSessionEvent(ws, { type: 'session.run.state_changed', runId, state: 'queued', ...(sessionId ? { sessionId } : {}) })
-
-  queue.enqueue(async () => {
-    if (state.canceled) throw new Error('Run canceled before start')
-
-    state.handle = createAgentRun({
-      prompt,
-      workspacePath: CONFIG.workspacePath,
-      ...(sessionId ? { sessionId } : {}),
-      ...(CONFIG.defaultModel ? { model: CONFIG.defaultModel } : {}),
-    }, (event: ServerEvent) => {
-      const sessionEvent = toSessionEvent(event)
-      if ('sessionId' in sessionEvent && sessionEvent.sessionId) state.sessionId = sessionEvent.sessionId
-      if (event.type === 'session.sdk.transport') {
-        return
-      }
-      forwardedEvents += 1
-      setForwardedEvents(forwardedEvents)
-      if (forwardedEvents === 1 || forwardedEvents % EVENT_LOG_INTERVAL === 0) {
-        logger.debug('run:event:forward', {
-          connId,
-          runId: shortId(runId),
-          count: forwardedEvents,
-          type: sessionEvent.type,
-          sessionId: 'sessionId' in sessionEvent ? shortId(sessionEvent.sessionId) : undefined,
-        })
-      }
-      sendSessionEvent(ws, sessionEvent)
-    }, abortController.signal, runId)
-
-    logger.info('run:started', {
-      connId,
-      runId: shortId(runId),
-      sessionId: shortId(state.sessionId),
-      queuePending: queue.pending,
-      queueActive: queue.active,
-    })
-    sendSessionEvent(ws, { type: 'session.run.started', runId, ...(state.sessionId ? { sessionId: state.sessionId } : {}) })
-    sendSessionEvent(ws, { type: 'session.run.state_changed', runId, state: 'running', ...(state.sessionId ? { sessionId: state.sessionId } : {}) })
-    return state.handle.done
-  }).then((result) => {
-    logger.info('run:completed', {
-      connId,
-      runId: shortId(runId),
-      sessionId: shortId(result.sessionId || state.sessionId),
-      exitCode: result.exitCode,
-      durationMs: Date.now() - startedAt,
-      forwardedEvents,
-      hasError: Boolean(result.error),
-    })
-    sendSessionEvent(ws, {
-      type: 'session.run.completed',
-      runId,
-      ...((result.sessionId || state.sessionId) ? { sessionId: result.sessionId || state.sessionId } : {}),
-      exitCode: result.exitCode,
-      ...(result.error ? { error: result.error } : {}),
-    })
-  }).catch((err) => {
-    if (!state.canceled) {
-      logger.error('run:failed', {
-        connId,
-        runId: shortId(runId),
-        sessionId: shortId(state.sessionId),
-        durationMs: Date.now() - startedAt,
-        error: err instanceof Error ? err.message : String(err),
-      })
-      sendSessionEvent(ws, { type: 'session.run.failed', runId, ...(state.sessionId ? { sessionId: state.sessionId } : {}), error: String(err) })
-      sendSessionEvent(ws, { type: 'session.run.state_changed', runId, state: 'failed', ...(state.sessionId ? { sessionId: state.sessionId } : {}) })
-    }
-  }).finally(() => {
-    if (state.canceled) {
-      logger.warn('run:cancelled', {
-        connId,
-        runId: shortId(runId),
-        sessionId: shortId(state.sessionId),
-        durationMs: Date.now() - startedAt,
-      })
-    }
-    setActiveRun(null)
-  })
-
-  return state
 }

@@ -13,6 +13,36 @@ export interface SessionSummary {
   updatedAt: number
 }
 
+export type ChannelType = 'web' | 'lark' | 'discord'
+
+export interface ChannelConversationRef {
+  channel: ChannelType
+  conversationKey: string
+  userKey?: string
+}
+
+export interface ChannelInboundMessage extends ChannelConversationRef {
+  text: string
+  sessionId?: string
+  platformMessageId?: string
+  replyToMessageId?: string
+}
+
+export interface ChannelOutboundMessage extends ChannelConversationRef {
+  runId: string
+  sessionId?: string
+  content: string
+  replyToMessageId?: string
+}
+
+export interface SessionBinding extends ChannelConversationRef {
+  sessionId: string
+  lastRunId?: string
+  activeInteractionId?: string
+  lastInboundPlatformMessageId?: string
+  updatedAt: number
+}
+
 export interface PendingInteractionBase {
   id: string
   kind: 'permission' | 'elicitation'
@@ -56,6 +86,7 @@ export interface RuntimeEnvelopeBase {
 }
 
 export type SdkTransportDirection = 'inbound' | 'outbound'
+export type ChannelLogDirection = 'inbound' | 'outbound' | 'internal'
 export type SdkTransportEventName =
   | 'query.start'
   | 'query.cancel'
@@ -102,6 +133,31 @@ export interface SessionRuntimeLogEntry {
 
 export interface SessionRuntimeLogPage {
   items: SessionRuntimeLogEntry[]
+  hasMore: boolean
+  nextCursor: number | null
+}
+
+export interface ChannelLogEvent {
+  source: 'channel'
+  channel: ChannelType
+  direction: ChannelLogDirection
+  eventName: string
+  conversationKey?: string
+  platformMessageId?: string
+  payloadSummary?: string
+  payload?: unknown
+}
+
+export interface SessionChannelLogEntry {
+  cursor: number
+  runId?: string
+  loggedAt: number
+  sessionId: string
+  event: ChannelLogEvent
+}
+
+export interface SessionChannelLogPage {
+  items: SessionChannelLogEntry[]
   hasMore: boolean
   nextCursor: number | null
 }

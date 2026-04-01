@@ -9,7 +9,6 @@ import { appendSessionRuntimeLog, appendSessionTransportLog } from './transport-
 export type { AgentEvent } from './agent-output-parser.js'
 
 const logger = createLogger('agent-runner')
-const EVENT_LOG_INTERVAL = 20
 
 export interface AgentInput {
   prompt: string
@@ -136,7 +135,6 @@ function attachSessionId(event: RunnerRuntimeEvent, sessionId: string): RunnerRu
 export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, signal?: AbortSignal, runId: string = randomUUID()): AgentRunHandle {
   const agentPath = resolve(CONFIG.agentRunnerPath)
   const events: AgentEvent[] = []
-  const startedAt = Date.now()
   let sessionId: string | undefined = input.sessionId
   let stderrOutput = ''
   const pendingRuntimeEvents: RunnerRuntimeEvent[] = []
@@ -158,14 +156,6 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
     }
   }
 
-  logger.info('runner:spawn:start', {
-    runId: shortId(runId),
-    sessionId: shortId(input.sessionId),
-    workspacePath: input.workspacePath,
-    promptLength: input.prompt.length,
-    model: input.model || CONFIG.defaultModel || '(default)',
-  })
-
   const child: ChildProcess = spawn('npx', ['tsx', agentPath], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: {
@@ -173,11 +163,6 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
       NODE_OPTIONS: '--max-old-space-size=4096',
     },
     cwd: process.cwd(),
-  })
-
-  logger.info('runner:spawned', {
-    runId: shortId(runId),
-    pid: child.pid,
   })
 
   const timeout = setTimeout(() => {
@@ -194,10 +179,6 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
 
   if (signal) {
     signal.addEventListener('abort', () => {
-      logger.warn('runner:abort', {
-        runId: shortId(runId),
-        pid: child.pid,
-      })
       child.kill('SIGTERM')
     }, { once: true })
   }
@@ -217,15 +198,6 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
       })
     })
 
-    if (events.length === 1 || events.length % EVENT_LOG_INTERVAL === 0) {
-      logger.debug('runner:stdout:event', {
-        runId: shortId(runId),
-        pid: child.pid,
-        count: events.length,
-        type: event.type,
-        sessionId: shortId(runtimeSessionId),
-      })
-    }
     const serverEvent = toServerEvent(runId, event)
     if (serverEvent) onEvent(serverEvent)
   })
@@ -261,15 +233,6 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
     child.on('close', (code) => {
       clearTimeout(timeout)
       parser.flush()
-      logger.info('runner:close', {
-        runId: shortId(runId),
-        pid: child.pid,
-        exitCode: code,
-        sessionId: shortId(sessionId),
-        eventCount: events.length,
-        durationMs: Date.now() - startedAt,
-        stderrTail: code !== 0 ? stderrOutput.slice(-300) : undefined,
-      })
       resolvePromise({
         sessionId,
         events,
@@ -284,26 +247,12 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
   return {
     done,
     respondToPermission(permissionId, decision) {
-      logger.info('runner:permission:respond', {
-        runId: shortId(runId),
-        permissionId: shortId(permissionId),
-        decision,
-      })
       writeCommand(child, { type: 'interaction.permission.respond', permissionId, decision })
     },
     respondToElicitation(requestId, response) {
-      logger.info('runner:elicitation:respond', {
-        runId: shortId(runId),
-        requestId: shortId(requestId),
-        action: response.action,
-      })
       writeCommand(child, { type: 'interaction.elicitation.respond', requestId, response })
     },
     cancel() {
-      logger.warn('runner:cancel', {
-        runId: shortId(runId),
-        sessionId: shortId(sessionId),
-      })
       onEvent({ type: 'session.run.state_changed', runId, state: 'cancelled', ...(sessionId ? { sessionId } : {}) })
       writeCommand(child, { type: 'run.cancel' })
       child.kill('SIGTERM')
