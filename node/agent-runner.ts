@@ -5,7 +5,7 @@ import { CONFIG } from './config.js'
 import { createOutputParser, type AgentEvent } from './agent-output-parser.js'
 import type { RunnerRuntimeEvent, SessionEvent } from '../shared/message-types.js'
 import { createLogger, shortId } from './logger.js'
-import { appendSessionTransportLog } from './transport-logs.js'
+import { appendSessionRuntimeLog, appendSessionTransportLog } from './transport-logs.js'
 export type { AgentEvent } from './agent-output-parser.js'
 
 const logger = createLogger('agent-runner')
@@ -113,12 +113,50 @@ function toServerEvent(runId: string, event: RunnerRuntimeEvent): ServerEvent | 
   }
 }
 
+function getEventSessionId(event: RunnerRuntimeEvent): string | undefined {
+  return event.type === 'sdk.transport' ? event.event.sessionId : event.sessionId
+}
+
+function attachSessionId(event: RunnerRuntimeEvent, sessionId: string): RunnerRuntimeEvent {
+  if (event.type === 'sdk.transport') {
+    return {
+      ...event,
+      event: {
+        ...event.event,
+        sessionId,
+      },
+    }
+  }
+  return {
+    ...event,
+    sessionId,
+  }
+}
+
 export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, signal?: AbortSignal, runId: string = randomUUID()): AgentRunHandle {
   const agentPath = resolve(CONFIG.agentRunnerPath)
   const events: AgentEvent[] = []
   const startedAt = Date.now()
   let sessionId: string | undefined = input.sessionId
   let stderrOutput = ''
+  const pendingRuntimeEvents: RunnerRuntimeEvent[] = []
+
+  async function persistRuntimeEvent(event: RunnerRuntimeEvent) {
+    const eventSessionId = getEventSessionId(event)
+    if (!eventSessionId) {
+      pendingRuntimeEvents.push(event)
+      return
+    }
+
+    const flushTargets = pendingRuntimeEvents.splice(0, pendingRuntimeEvents.length)
+    for (const pendingEvent of [...flushTargets, event]) {
+      const hydrated = getEventSessionId(pendingEvent) ? pendingEvent : attachSessionId(pendingEvent, eventSessionId)
+      await appendSessionRuntimeLog(runId, hydrated)
+      if (hydrated.type === 'sdk.transport') {
+        await appendSessionTransportLog(runId, hydrated.event)
+      }
+    }
+  }
 
   logger.info('runner:spawn:start', {
     runId: shortId(runId),
@@ -167,25 +205,25 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
   const parser = createOutputParser((event) => {
     events.push(event)
     if (!isRunnerRuntimeEvent(event)) return
-    if (event.type === 'sdk.transport') {
-      if (event.event.sessionId) sessionId = event.event.sessionId
-      void appendSessionTransportLog(runId, event.event).catch((error) => {
-        logger.error('runner:transport-log:append-error', {
-          runId: shortId(runId),
-          sessionId: shortId(event.event.sessionId),
-          error: error instanceof Error ? error.message : String(error),
-        })
+
+    const runtimeSessionId = getEventSessionId(event)
+    if (runtimeSessionId) sessionId = runtimeSessionId
+
+    void persistRuntimeEvent(event).catch((error) => {
+      logger.error('runner:runtime-log:append-error', {
+        runId: shortId(runId),
+        sessionId: shortId(runtimeSessionId || sessionId),
+        error: error instanceof Error ? error.message : String(error),
       })
-    } else if (event.sessionId) {
-      sessionId = event.sessionId
-    }
+    })
+
     if (events.length === 1 || events.length % EVENT_LOG_INTERVAL === 0) {
       logger.debug('runner:stdout:event', {
         runId: shortId(runId),
         pid: child.pid,
         count: events.length,
         type: event.type,
-        sessionId: shortId(event.type === 'sdk.transport' ? event.event.sessionId : event.sessionId),
+        sessionId: shortId(runtimeSessionId),
       })
     }
     const serverEvent = toServerEvent(runId, event)

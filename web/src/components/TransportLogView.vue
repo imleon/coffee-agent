@@ -5,6 +5,8 @@ import { stringifyStructuredValue } from '../../../shared/transcript-normalizer.
 
 const logView = useLogViewStore()
 const transportItems = computed(() => logView.transportLog)
+const runtimeItems = computed(() => logView.runtimeLog.filter((item) => item.event.type !== 'sdk.transport'))
+const activeItems = computed(() => logView.selectedLogTab === 'transport' ? transportItems.value : runtimeItems.value)
 const sortedSessions = computed(() => (
   [...logView.sessions].sort((left, right) => {
     const leftTime = typeof left.updatedAt === 'number' && Number.isFinite(left.updatedAt) ? left.updatedAt : 0
@@ -15,6 +17,12 @@ const sortedSessions = computed(() => (
 const preservingOlderScroll = ref(false)
 const scrollContainer = ref<HTMLElement | null>(null)
 const scrollToLatestPending = ref(true)
+const transportGridTemplate = '28ch 6ch 24ch 10ch 14ch 18ch 18ch minmax(24ch, 1fr)'
+const transportGridStyle = {
+  gridTemplateColumns: transportGridTemplate,
+  width: 'max-content',
+  minWidth: '100%',
+}
 
 function getTransportDirectionLabel(direction: string): string {
   return direction === 'inbound' ? 'IN' : 'OUT'
@@ -24,7 +32,7 @@ function getTransportTitle(item: { event: { eventName: string; sdkType?: string;
   const { eventName, sdkType, sdkSubtype } = item.event
   if (eventName === 'message') {
     if (!sdkType) return 'message'
-    return sdkSubtype ? `${sdkType}.${sdkSubtype}` : sdkType
+    return sdkSubtype ? `message(${sdkType}.${sdkSubtype})` : `message(${sdkType})`
   }
   return eventName
 }
@@ -72,6 +80,67 @@ function getEventTagClass(eventName: string): string {
   return 'border-gray-200 bg-gray-100 text-gray-700'
 }
 
+function getRowClass(eventName: string): string {
+  return eventName === 'query.start'
+    ? 'bg-emerald-50/50 hover:bg-emerald-100/50'
+    : 'hover:bg-gray-50'
+}
+
+function getRuntimeTypeClass(type: string): string {
+  if (type.startsWith('run.')) return 'border-amber-200 bg-amber-50 text-amber-700'
+  if (type.startsWith('sdk.control.')) return 'border-fuchsia-200 bg-fuchsia-50 text-fuchsia-700'
+  if (type === 'sdk.message') return 'border-sky-200 bg-sky-50 text-sky-700'
+  if (type === 'sdk.transport') return 'border-emerald-200 bg-emerald-50 text-emerald-700'
+  return 'border-gray-200 bg-gray-100 text-gray-700'
+}
+
+function getRuntimeRowClass(type: string): string {
+  return type === 'run.started'
+    ? 'bg-emerald-50/30 hover:bg-emerald-100/40'
+    : 'hover:bg-gray-50'
+}
+
+function getRuntimeSummary(item: { event: Record<string, unknown> }): string {
+  const { event } = item
+  if (typeof event.type !== 'string') return '-'
+  if (event.type === 'run.state_changed') return typeof event.state === 'string' ? event.state : '-'
+  if (event.type === 'run.completed') return typeof event.messageCount === 'number' ? `messages=${event.messageCount}` : '-'
+  if (event.type === 'run.failed') return typeof event.error === 'string' ? event.error : '-'
+  if (event.type === 'sdk.message') {
+    const payload = event.payload
+    if (payload && typeof payload === 'object') {
+      const record = payload as Record<string, unknown>
+      if (typeof record.type === 'string') {
+        const subtype = typeof record.subtype === 'string' ? `.${record.subtype}` : ''
+        return `${record.type}${subtype}`
+      }
+    }
+  }
+  if (event.type === 'sdk.control.requested' || event.type === 'sdk.control.resolved') {
+    const interaction = event.interaction
+    if (interaction && typeof interaction === 'object') {
+      const record = interaction as Record<string, unknown>
+      if (typeof record.kind === 'string') return record.kind
+    }
+  }
+  if (event.type === 'sdk.transport') {
+    const transportEvent = event.event
+    if (transportEvent && typeof transportEvent === 'object') {
+      const record = transportEvent as Record<string, unknown>
+      return typeof record.eventName === 'string' ? record.eventName : 'sdk.transport'
+    }
+  }
+  return '-'
+}
+
+function getRuntimePayload(item: { event: Record<string, unknown> }): unknown {
+  const { event } = item
+  if (event.type === 'sdk.message') return event.payload
+  if (event.type === 'sdk.control.requested' || event.type === 'sdk.control.resolved') return event.payload ?? event.interaction
+  if (event.type === 'sdk.transport') return event.event
+  return item.event
+}
+
 const liveButtonClass = computed(() => (
   logView.transportLogLive
     ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
@@ -80,7 +149,7 @@ const liveButtonClass = computed(() => (
 
 const liveButtonLabel = computed(() => {
   if (logView.transportLogLive) {
-    return logView.transportLogRefreshing ? 'LIVE · SYNCING' : 'LIVE'
+    return (logView.transportLogRefreshing || logView.runtimeLogRefreshing) ? 'LIVE · SYNCING' : 'LIVE'
   }
   return 'PAUSED'
 })
@@ -95,12 +164,18 @@ async function scrollToBottom() {
 async function handleScroll() {
   const container = scrollContainer.value
   if (!container || container.scrollTop > 120) return
-  if (!logView.transportLogHasMore || logView.transportLogLoading) return
+  if (logView.selectedLogTab === 'transport') {
+    if (!logView.transportLogHasMore || logView.transportLogLoading) return
+  } else {
+    if (!logView.runtimeLogHasMore || logView.runtimeLogLoading) return
+  }
 
   preservingOlderScroll.value = true
   const previousHeight = container.scrollHeight
   const previousTop = container.scrollTop
-  const loaded = await logView.loadOlderTransportLogs()
+  const loaded = logView.selectedLogTab === 'transport'
+    ? await logView.loadOlderTransportLogs()
+    : await logView.loadOlderRuntimeLogs()
   if (!loaded) {
     preservingOlderScroll.value = false
     return
@@ -118,7 +193,13 @@ watch(() => logView.selectedSessionId, (next, prev) => {
   }
 })
 
-watch(() => transportItems.value.length, async (next, prev) => {
+watch(() => logView.selectedLogTab, (next, prev) => {
+  if (next !== prev) {
+    scrollToLatestPending.value = true
+  }
+})
+
+watch(() => activeItems.value.length, async (next, prev) => {
   if (next === prev || preservingOlderScroll.value || next === 0) return
   if (scrollToLatestPending.value) {
     scrollToLatestPending.value = false
@@ -135,13 +216,18 @@ onMounted(() => {
   logView.ensureSessionsLoaded().then(() => {
     if (logView.selectedSessionId) {
       scrollToLatestPending.value = true
-      void logView.reloadTransportLogs()
+      void Promise.all([
+        logView.reloadTransportLogs(),
+        logView.reloadRuntimeLogs(),
+      ])
     }
   })
 })
 
 onBeforeUnmount(() => {
   logView.stopSessionListRefresh()
+  logView.stopTransportFollow()
+  logView.stopRuntimeFollow()
 })
 </script>
 
@@ -149,8 +235,8 @@ onBeforeUnmount(() => {
   <div class="flex h-full min-h-0 flex-col bg-gray-50 p-3">
     <div class="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col gap-2">
       <div class="border-b border-gray-200 pb-2">
-        <h2 class="text-sm font-semibold text-gray-900">SDK transport log</h2>
-        <p class="mt-0.5 text-[11px] text-gray-500">Log 模块独立选择 session，不跟主聊天联动。</p>
+        <h2 class="text-sm font-semibold text-gray-900">SDK logs</h2>
+        <p class="mt-0.5 text-[11px] text-gray-500">同一 session 下可切换查看 transport 结构化日志与完整 runtime 日志。</p>
       </div>
 
       <div class="flex items-center justify-between gap-2 pb-1">
@@ -165,6 +251,22 @@ onBeforeUnmount(() => {
               {{ formatSessionActivity(item.updatedAt) }}  {{ item.title }}
             </option>
           </select>
+          <div class="inline-flex rounded border border-gray-300 bg-white p-0.5 text-[11px]">
+            <button
+              class="rounded px-2 py-1"
+              :class="logView.selectedLogTab === 'transport' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-100'"
+              @click="logView.selectLogTab('transport')"
+            >
+              Transport
+            </button>
+            <button
+              class="rounded px-2 py-1"
+              :class="logView.selectedLogTab === 'runtime' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-100'"
+              @click="logView.selectLogTab('runtime')"
+            >
+              Runtime
+            </button>
+          </div>
           <div class="truncate text-[11px] text-gray-500">
             <span class="text-gray-400">session:</span>
             <span class="ml-1 text-gray-800">{{ logView.selectedSessionId || 'none' }}</span>
@@ -173,7 +275,7 @@ onBeforeUnmount(() => {
         <button
           class="rounded border px-2 py-1 text-[11px] font-semibold tracking-wide disabled:cursor-not-allowed disabled:opacity-50"
           :class="liveButtonClass"
-          :disabled="!logView.selectedSessionId || logView.transportLogLoading"
+          :disabled="!logView.selectedSessionId || (logView.selectedLogTab === 'transport' ? logView.transportLogLoading : logView.runtimeLogLoading)"
           @click="logView.toggleTransportLive"
         >
           {{ liveButtonLabel }}
@@ -181,55 +283,97 @@ onBeforeUnmount(() => {
       </div>
 
       <div class="min-h-0 flex-1 overflow-hidden rounded border border-gray-200 bg-white font-mono">
-        <div v-if="transportItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
-          No SDK transport logs yet.
-        </div>
+        <template v-if="logView.selectedLogTab === 'transport'">
+          <div v-if="transportItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
+            No SDK transport logs yet.
+          </div>
 
-        <div v-else ref="scrollContainer" class="h-full overflow-y-auto" @scroll="handleScroll">
-          <div class="sticky top-0 z-10 grid grid-cols-[28ch_6ch_18ch_10ch_14ch_18ch_18ch_10ch_minmax(0,1fr)] gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2 text-[10px] uppercase tracking-wide text-gray-500">
-            <div>Timestamp</div>
-            <div>Dir</div>
-            <div>Event</div>
-            <div>Seq</div>
-            <div>Run</div>
-            <div>Request</div>
-            <div>ToolUse</div>
-            <div>Cursor</div>
-            <div>Details</div>
-          </div>
-          <div
-            v-for="item in transportItems"
-            :key="`sdk-transport-${item.cursor}`"
-            class="grid grid-cols-[28ch_6ch_18ch_10ch_14ch_18ch_18ch_10ch_minmax(0,1fr)] gap-3 border-b border-gray-100 px-3 py-2 text-[11px] leading-5 transition-colors hover:bg-gray-50 last:border-b-0"
-          >
-            <div class="shrink-0 whitespace-nowrap text-gray-500">{{ formatTimestamp(item.event.receivedAt) }}</div>
-            <div>
-              <span class="inline-flex min-w-[3.5ch] justify-center rounded border px-1.5 py-0 font-medium" :class="getDirectionClass(item.event.direction)">
-                {{ getTransportDirectionLabel(item.event.direction) }}
-              </span>
+          <div v-else ref="scrollContainer" class="h-full overflow-auto" @scroll="handleScroll">
+            <div class="sticky top-0 z-10 grid gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2 text-[10px] uppercase tracking-wide text-gray-500" :style="transportGridStyle">
+              <div>Time</div>
+              <div>Dir</div>
+              <div>Transport Event</div>
+              <div>Seq</div>
+              <div>Run ID</div>
+              <div>Request ID</div>
+              <div>Tool Use ID</div>
+              <div>Summary</div>
             </div>
-            <div>
-              <span class="inline-flex max-w-full truncate rounded border px-1.5 py-0 font-medium" :class="getEventTagClass(item.event.eventName)">
-                {{ item.event.eventName }}
-              </span>
-            </div>
-            <div class="shrink-0 text-gray-400">#{{ item.event.sequence }}</div>
-            <div class="shrink-0 text-gray-400">{{ item.runId.slice(0, 8) }}</div>
-            <div class="truncate text-gray-500">{{ item.event.requestId || '-' }}</div>
-            <div class="truncate text-gray-500">{{ item.event.toolUseId || '-' }}</div>
-            <div class="shrink-0 text-gray-500">{{ item.cursor }}</div>
-            <div class="min-w-0">
-              <div class="truncate font-medium text-gray-900">{{ getTransportTitle(item) }}</div>
-              <div v-if="item.event.payloadSummary" class="truncate text-gray-700">
-                {{ item.event.payloadSummary }}
+            <div
+              v-for="item in transportItems"
+              :key="`sdk-transport-${item.runId}-${item.event.sequence}-${item.event.receivedAt}`"
+              class="grid gap-3 border-b border-gray-100 px-3 py-2 text-[11px] leading-5 transition-colors last:border-b-0"
+              :class="getRowClass(item.event.eventName)"
+              :style="transportGridStyle"
+            >
+              <div class="shrink-0 whitespace-nowrap text-gray-500">{{ formatTimestamp(item.event.receivedAt) }}</div>
+              <div>
+                <span class="inline-flex min-w-[3.5ch] justify-center rounded border px-1.5 py-0 font-medium" :class="getDirectionClass(item.event.direction)">
+                  {{ getTransportDirectionLabel(item.event.direction) }}
+                </span>
               </div>
-              <details v-if="item.event.payload !== undefined" class="mt-1">
-                <summary class="cursor-pointer text-gray-500 hover:text-gray-700">Raw payload</summary>
-                <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(item.event.payload) }}</pre>
-              </details>
+              <div class="min-w-0">
+                <span class="inline-flex whitespace-nowrap rounded border px-1.5 py-0 font-medium align-top" :class="getEventTagClass(item.event.eventName)">
+                  {{ getTransportTitle(item) }}
+                </span>
+              </div>
+              <div class="shrink-0 text-gray-400">#{{ item.event.sequence }}</div>
+              <div class="shrink-0 text-gray-400">{{ item.runId.slice(0, 8) }}</div>
+              <div class="truncate text-gray-500">{{ item.event.requestId || '-' }}</div>
+              <div class="truncate text-gray-500">{{ item.event.toolUseId || '-' }}</div>
+              <div class="min-w-0">
+                <div v-if="item.event.payloadSummary" class="truncate text-gray-700">
+                  {{ item.event.payloadSummary }}
+                </div>
+                <details v-if="item.event.payload !== undefined" class="mt-1 rounded border border-emerald-200 bg-emerald-50/40 px-2 py-1">
+                  <summary class="cursor-pointer text-emerald-700 hover:text-emerald-800">Payload</summary>
+                  <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(item.event.payload) }}</pre>
+                </details>
+              </div>
             </div>
           </div>
-        </div>
+        </template>
+
+        <template v-else>
+          <div v-if="runtimeItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
+            No runtime logs yet.
+          </div>
+
+          <div v-else ref="scrollContainer" class="h-full overflow-auto" @scroll="handleScroll">
+            <div class="sticky top-0 z-10 grid grid-cols-[28ch_16ch_10ch_14ch_minmax(28ch,1fr)] gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2 text-[10px] uppercase tracking-wide text-gray-500">
+              <div>Time</div>
+              <div>Runtime Event</div>
+              <div>Seq</div>
+              <div>Run ID</div>
+              <div>Details</div>
+            </div>
+            <div
+              v-for="item in runtimeItems"
+              :key="`runtime-${item.runId}-${item.cursor}`"
+              class="grid grid-cols-[28ch_16ch_10ch_14ch_minmax(28ch,1fr)] gap-3 border-b border-gray-100 px-3 py-2 text-[11px] leading-5 transition-colors last:border-b-0"
+              :class="getRuntimeRowClass(item.event.type)"
+            >
+              <div class="shrink-0 whitespace-nowrap text-gray-500">{{ formatTimestamp(item.loggedAt) }}</div>
+              <div class="min-w-0">
+                <span class="inline-flex whitespace-nowrap rounded border px-1.5 py-0 font-medium align-top" :class="getRuntimeTypeClass(item.event.type)">
+                  {{ item.event.type }}
+                </span>
+              </div>
+              <div class="shrink-0 text-gray-400">
+                <template v-if="'sequence' in item.event && typeof item.event.sequence === 'number'">#{{ item.event.sequence }}</template>
+                <template v-else>-</template>
+              </div>
+              <div class="shrink-0 text-gray-400">{{ item.runId.slice(0, 8) }}</div>
+              <div class="min-w-0">
+                <div class="truncate text-gray-700">{{ getRuntimeSummary(item) }}</div>
+                <details class="mt-1 rounded border border-gray-200 bg-gray-50/70 px-2 py-1">
+                  <summary class="cursor-pointer text-gray-600 hover:text-gray-800">Payload</summary>
+                  <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(getRuntimePayload(item)) }}</pre>
+                </details>
+              </div>
+            </div>
+          </div>
+        </template>
       </div>
     </div>
   </div>

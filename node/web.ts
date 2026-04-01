@@ -7,7 +7,7 @@ import { createAgentRun, type AgentRunHandle, type ServerEvent } from './agent-r
 import type { SessionEvent } from '../shared/message-types.js'
 import { TaskQueue } from './queue.js'
 import { listAllSessions, getMessages } from './sessions.js'
-import { readSessionTransportLogs } from './transport-logs.js'
+import { readSessionRuntimeLogs, readSessionTransportLogs } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
 
 const queue = new TaskQueue(CONFIG.maxConcurrentAgents)
@@ -140,6 +140,25 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
       return c.json(page)
     } catch (err) {
       logger.error('http:transport-logs:error', {
+        error: err instanceof Error ? err.message : String(err),
+        durationMs: Date.now() - startedAt,
+      })
+      return c.json({ items: [], hasMore: false, nextCursor: null, error: String(err) })
+    }
+  })
+
+  app.get('/api/sessions/:id/runtime-logs', async (c) => {
+    const startedAt = Date.now()
+    try {
+      const id = c.req.param('id')
+      const limit = parseInt(c.req.query('limit') || '100', 10)
+      const cursorRaw = c.req.query('cursor')
+      const follow = c.req.query('follow') === '1'
+      const cursor = cursorRaw ? parseInt(cursorRaw, 10) : null
+      const page = await readSessionRuntimeLogs(id, Number.isFinite(cursor) ? cursor : null, limit, follow)
+      return c.json(page)
+    } catch (err) {
+      logger.error('http:runtime-logs:error', {
         error: err instanceof Error ? err.message : String(err),
         durationMs: Date.now() - startedAt,
       })

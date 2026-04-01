@@ -1,11 +1,17 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import type { SessionSummary, SessionTransportLogEntry } from '../../../shared/message-types.js'
+import type { SessionRuntimeLogEntry, SessionSummary, SessionTransportLogEntry } from '../../../shared/message-types.js'
 import { createDebugLogger } from '../lib/debug.js'
 import { useSessionStore } from './session'
 
 interface TransportLogsResponse {
   items?: SessionTransportLogEntry[]
+  hasMore?: boolean
+  nextCursor?: number | null
+}
+
+interface RuntimeLogsResponse {
+  items?: SessionRuntimeLogEntry[]
   hasMore?: boolean
   nextCursor?: number | null
 }
@@ -20,6 +26,7 @@ function shortId(value?: string | null): string | undefined {
 export const useLogViewStore = defineStore('log-view', () => {
   const sessionStore = useSessionStore()
   const selectedSessionId = ref<string | null>(null)
+  const selectedLogTab = ref<'transport' | 'runtime'>('transport')
   const transportLog = ref<SessionTransportLogEntry[]>([])
   const transportLogHasMore = ref(false)
   const transportLogCursor = ref<number | null>(null)
@@ -27,7 +34,14 @@ export const useLogViewStore = defineStore('log-view', () => {
   const transportLogRefreshing = ref(false)
   const transportLogFollowing = ref(false)
   const transportLogLive = ref(true)
+  const runtimeLog = ref<SessionRuntimeLogEntry[]>([])
+  const runtimeLogHasMore = ref(false)
+  const runtimeLogCursor = ref<number | null>(null)
+  const runtimeLogLoading = ref(false)
+  const runtimeLogRefreshing = ref(false)
+  const runtimeLogFollowing = ref(false)
   let transportFollowTimer: number | null = null
+  let runtimeFollowTimer: number | null = null
   let sessionListRefreshTimer: number | null = null
 
   const sessions = computed<SessionSummary[]>(() => sessionStore.sessions)
@@ -38,6 +52,14 @@ export const useLogViewStore = defineStore('log-view', () => {
       transportFollowTimer = null
     }
     transportLogFollowing.value = false
+  }
+
+  function stopRuntimeFollow() {
+    if (runtimeFollowTimer !== null) {
+      window.clearTimeout(runtimeFollowTimer)
+      runtimeFollowTimer = null
+    }
+    runtimeLogFollowing.value = false
   }
 
   function stopSessionListRefresh() {
@@ -140,6 +162,58 @@ export const useLogViewStore = defineStore('log-view', () => {
     }
   }
 
+  async function loadRuntimeLogs(sessionId: string, options: { cursor?: number | null; append?: boolean; follow?: boolean } = {}) {
+    if (!sessionId || runtimeLogLoading.value) return false
+
+    runtimeLogLoading.value = true
+    runtimeLogRefreshing.value = !options.append
+    try {
+      const params = new URLSearchParams()
+      params.set('limit', '100')
+      if (typeof options.cursor === 'number') params.set('cursor', String(options.cursor))
+      if (options.follow) params.set('follow', '1')
+      const res = await apiFetch(`/api/sessions/${sessionId}/runtime-logs?${params.toString()}`)
+      if (!res.ok) {
+        logger.warn('runtime:load:error', {
+          sessionId: shortId(sessionId),
+          status: res.status,
+          cursor: options.cursor,
+          follow: options.follow,
+        })
+        return false
+      }
+      const data = await res.json() as RuntimeLogsResponse
+      const items = Array.isArray(data.items) ? data.items : []
+      if (options.append) {
+        runtimeLog.value = [...items, ...runtimeLog.value]
+      } else if (options.follow) {
+        runtimeLog.value = [...runtimeLog.value, ...items]
+      } else {
+        runtimeLog.value = items
+      }
+      runtimeLogHasMore.value = Boolean(data.hasMore)
+      runtimeLogCursor.value = typeof data.nextCursor === 'number' ? data.nextCursor : null
+      logger.info('runtime:load:success', {
+        sessionId: shortId(sessionId),
+        count: items.length,
+        total: runtimeLog.value.length,
+        hasMore: runtimeLogHasMore.value,
+        cursor: runtimeLogCursor.value,
+        follow: options.follow,
+      })
+      return true
+    } catch (error) {
+      logger.error('runtime:load:error', {
+        sessionId: shortId(sessionId),
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    } finally {
+      runtimeLogLoading.value = false
+      runtimeLogRefreshing.value = false
+    }
+  }
+
   async function reloadTransportLogs() {
     transportLog.value = []
     transportLogHasMore.value = false
@@ -153,15 +227,39 @@ export const useLogViewStore = defineStore('log-view', () => {
     return loaded
   }
 
+  async function reloadRuntimeLogs() {
+    runtimeLog.value = []
+    runtimeLogHasMore.value = false
+    runtimeLogCursor.value = null
+    stopRuntimeFollow()
+    if (!selectedSessionId.value) return false
+    const loaded = await loadRuntimeLogs(selectedSessionId.value)
+    if (loaded && transportLogLive.value) {
+      scheduleRuntimeFollow()
+    }
+    return loaded
+  }
+
   async function refreshTransportLogs() {
     if (!selectedSessionId.value) return false
     const lastCursor = transportLog.value.length > 0 ? transportLog.value[transportLog.value.length - 1]?.cursor ?? null : null
     return loadTransportLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
   }
 
+  async function refreshRuntimeLogs() {
+    if (!selectedSessionId.value) return false
+    const lastCursor = runtimeLog.value.length > 0 ? runtimeLog.value[runtimeLog.value.length - 1]?.cursor ?? null : null
+    return loadRuntimeLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
+  }
+
   async function loadOlderTransportLogs() {
     if (!selectedSessionId.value || !transportLogHasMore.value || transportLogCursor.value === null) return false
     return loadTransportLogs(selectedSessionId.value, { cursor: transportLogCursor.value, append: true })
+  }
+
+  async function loadOlderRuntimeLogs() {
+    if (!selectedSessionId.value || !runtimeLogHasMore.value || runtimeLogCursor.value === null) return false
+    return loadRuntimeLogs(selectedSessionId.value, { cursor: runtimeLogCursor.value, append: true })
   }
 
   function scheduleTransportFollow() {
@@ -174,16 +272,31 @@ export const useLogViewStore = defineStore('log-view', () => {
     }, 1500)
   }
 
+  function scheduleRuntimeFollow() {
+    stopRuntimeFollow()
+    if (!selectedSessionId.value || !transportLogLive.value) return
+    runtimeLogFollowing.value = true
+    runtimeFollowTimer = window.setTimeout(async () => {
+      await refreshRuntimeLogs()
+      scheduleRuntimeFollow()
+    }, 1500)
+  }
+
   async function setTransportLive(enabled: boolean) {
     transportLogLive.value = enabled
     if (!enabled) {
       stopTransportFollow()
+      stopRuntimeFollow()
       return false
     }
     if (!selectedSessionId.value) return false
-    const loaded = await refreshTransportLogs()
+    const [transportLoaded, runtimeLoaded] = await Promise.all([
+      refreshTransportLogs(),
+      refreshRuntimeLogs(),
+    ])
     scheduleTransportFollow()
-    return loaded
+    scheduleRuntimeFollow()
+    return transportLoaded || runtimeLoaded
   }
 
   async function toggleTransportLive() {
@@ -195,30 +308,48 @@ export const useLogViewStore = defineStore('log-view', () => {
     selectedSessionId.value = sessionId
   }
 
+  function selectLogTab(tab: 'transport' | 'runtime') {
+    selectedLogTab.value = tab
+  }
+
   watch(selectedSessionId, async (next, prev) => {
     if (next && next !== prev) {
-      await reloadTransportLogs()
+      await Promise.all([
+        reloadTransportLogs(),
+        reloadRuntimeLogs(),
+      ])
     }
   })
 
   return {
     sessions,
     selectedSessionId,
+    selectedLogTab,
     transportLog,
     transportLogHasMore,
     transportLogLoading,
     transportLogRefreshing,
     transportLogFollowing,
     transportLogLive,
+    runtimeLog,
+    runtimeLogHasMore,
+    runtimeLogLoading,
+    runtimeLogRefreshing,
+    runtimeLogFollowing,
     ensureSessionsLoaded,
     refreshSessionList,
     startSessionListRefresh,
     stopSessionListRefresh,
     selectSession,
+    selectLogTab,
     reloadTransportLogs,
+    reloadRuntimeLogs,
     refreshTransportLogs,
+    refreshRuntimeLogs,
     loadOlderTransportLogs,
+    loadOlderRuntimeLogs,
     stopTransportFollow,
+    stopRuntimeFollow,
     setTransportLive,
     toggleTransportLive,
   }

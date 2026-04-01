@@ -85,9 +85,7 @@ function summarizeValue(value: unknown): string {
 }
 
 function shouldIncludeTransportPayload(): boolean {
-  const raw = (process.env.COTTA_DEBUG_SDK_TRANSPORT || process.env.COTTA_DEBUG || '').trim().toLowerCase()
-  if (!raw) return false
-  return raw === '1' || raw === 'true' || raw === '*' || raw.split(',').map((part) => part.trim()).includes('sdk-transport')
+  return true
 }
 
 function maybeTransportPayload(payload: unknown): { payload?: unknown } {

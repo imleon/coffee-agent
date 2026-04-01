@@ -80,8 +80,6 @@ onMounted(() => {
             </div>
 
             <div class="flex items-center gap-4 text-xs text-gray-500">
-              <div>Run state: {{ session.runState }}</div>
-              <div>SDK events: {{ session.eventLog.length }}</div>
               <p v-if="session.authError" class="text-red-500">{{ session.authError }}</p>
               <button
                 v-if="session.authRequired"

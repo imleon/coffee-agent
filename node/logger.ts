@@ -4,6 +4,8 @@ type LogFields = Record<string, unknown>
 
 const REDACTED = '[REDACTED]'
 const MAX_STRING_LENGTH = 160
+const MAX_ARRAY_DEPTH = 3
+const MAX_OBJECT_DEPTH = 4
 
 function isDebugEnabled(scope: string): boolean {
   const raw = (process.env.COTTA_DEBUG || process.env.DEBUG || '').trim()
@@ -36,11 +38,11 @@ export function sanitizeValue(value: unknown, depth: number = 0): unknown {
   if (typeof value === 'number' || typeof value === 'boolean') return value
   if (value instanceof Error) return { name: value.name, message: sanitizeString(value.message) }
   if (Array.isArray(value)) {
-    if (depth >= 2) return `[array:${value.length}]`
+    if (depth >= MAX_ARRAY_DEPTH) return `[array:${value.length}]`
     return value.slice(0, 10).map((item) => sanitizeValue(item, depth + 1))
   }
   if (typeof value === 'object') {
-    if (depth >= 2) return '[object]'
+    if (depth >= MAX_OBJECT_DEPTH) return '[object]'
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>).map(([key, entryValue]) => [
         key,

@@ -92,6 +92,20 @@ export interface SessionTransportLogPage {
   nextCursor: number | null
 }
 
+export interface SessionRuntimeLogEntry {
+  cursor: number
+  runId: string
+  loggedAt: number
+  sessionId: string
+  event: RunnerRuntimeEvent
+}
+
+export interface SessionRuntimeLogPage {
+  items: SessionRuntimeLogEntry[]
+  hasMore: boolean
+  nextCursor: number | null
+}
+
 export type RunnerAgentInput = {
   prompt: string
   sessionId?: string
