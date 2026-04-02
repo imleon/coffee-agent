@@ -1,6 +1,12 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
-import type { SessionChannelLogEntry, SessionRuntimeLogEntry, SessionSummary, SessionTransportLogEntry } from '../../../shared/message-types.js'
+import type {
+  SessionChannelLogEntry,
+  SessionPersistentLogEntry,
+  SessionRuntimeLogEntry,
+  SessionSummary,
+  SessionTransportLogEntry,
+} from '../../../shared/message-types.js'
 import { createDebugLogger } from '../lib/debug.js'
 import { useSessionStore } from './session'
 
@@ -22,6 +28,16 @@ interface ChannelLogsResponse {
   nextCursor?: number | null
 }
 
+interface PersistentLogsResponse {
+  items?: SessionPersistentLogEntry[]
+  hasMore?: boolean
+  nextCursor?: number | null
+}
+
+type LogTab = 'transport' | 'runtime' | 'channel' | 'persistent'
+type PersistentLogKind = 'transport' | 'runtime' | 'channel'
+type StructuredLogTab = 'transport' | 'runtime' | 'channel'
+
 const logger = createDebugLogger('log-view-store')
 const SESSION_LIST_REFRESH_INTERVAL_MS = 3000
 
@@ -32,7 +48,9 @@ function shortId(value?: string | null): string | undefined {
 export const useLogViewStore = defineStore('log-view', () => {
   const sessionStore = useSessionStore()
   const selectedSessionId = ref<string | null>(null)
-  const selectedLogTab = ref<'transport' | 'runtime' | 'channel'>('transport')
+  const selectedLogTab = ref<LogTab>('transport')
+  const persistentLogKind = ref<PersistentLogKind>('transport')
+  const persistentBaseTab = ref<StructuredLogTab>('transport')
   const transportLog = ref<SessionTransportLogEntry[]>([])
   const transportLogHasMore = ref(false)
   const transportLogCursor = ref<number | null>(null)
@@ -52,9 +70,16 @@ export const useLogViewStore = defineStore('log-view', () => {
   const channelLogLoading = ref(false)
   const channelLogRefreshing = ref(false)
   const channelLogFollowing = ref(false)
+  const persistentLog = ref<SessionPersistentLogEntry[]>([])
+  const persistentLogHasMore = ref(false)
+  const persistentLogCursor = ref<number | null>(null)
+  const persistentLogLoading = ref(false)
+  const persistentLogRefreshing = ref(false)
+  const persistentLogFollowing = ref(false)
   let transportFollowTimer: number | null = null
   let runtimeFollowTimer: number | null = null
   let channelFollowTimer: number | null = null
+  let persistentFollowTimer: number | null = null
   let sessionListRefreshTimer: number | null = null
 
   const sessions = computed<SessionSummary[]>(() => sessionStore.sessions)
@@ -81,6 +106,14 @@ export const useLogViewStore = defineStore('log-view', () => {
       channelFollowTimer = null
     }
     channelLogFollowing.value = false
+  }
+
+  function stopPersistentFollow() {
+    if (persistentFollowTimer !== null) {
+      window.clearTimeout(persistentFollowTimer)
+      persistentFollowTimer = null
+    }
+    persistentLogFollowing.value = false
   }
 
   function stopSessionListRefresh() {
@@ -287,6 +320,62 @@ export const useLogViewStore = defineStore('log-view', () => {
     }
   }
 
+  async function loadPersistentLogs(sessionId: string, options: { cursor?: number | null; append?: boolean; follow?: boolean } = {}) {
+    if (!sessionId || persistentLogLoading.value) return false
+
+    persistentLogLoading.value = true
+    persistentLogRefreshing.value = !options.append
+    try {
+      const params = new URLSearchParams()
+      params.set('limit', '100')
+      params.set('kind', persistentLogKind.value)
+      if (typeof options.cursor === 'number') params.set('cursor', String(options.cursor))
+      if (options.follow) params.set('follow', '1')
+      const res = await apiFetch(`/api/sessions/${sessionId}/persistent-logs?${params.toString()}`)
+      if (!res.ok) {
+        logger.warn('persistent:load:error', {
+          sessionId: shortId(sessionId),
+          kind: persistentLogKind.value,
+          status: res.status,
+          cursor: options.cursor,
+          follow: options.follow,
+        })
+        return false
+      }
+      const data = await res.json() as PersistentLogsResponse
+      const items = Array.isArray(data.items) ? data.items : []
+      if (options.append) {
+        persistentLog.value = [...items, ...persistentLog.value]
+      } else if (options.follow) {
+        persistentLog.value = [...persistentLog.value, ...items]
+      } else {
+        persistentLog.value = items
+      }
+      persistentLogHasMore.value = Boolean(data.hasMore)
+      persistentLogCursor.value = typeof data.nextCursor === 'number' ? data.nextCursor : null
+      logger.info('persistent:load:success', {
+        sessionId: shortId(sessionId),
+        kind: persistentLogKind.value,
+        count: items.length,
+        total: persistentLog.value.length,
+        hasMore: persistentLogHasMore.value,
+        cursor: persistentLogCursor.value,
+        follow: options.follow,
+      })
+      return true
+    } catch (error) {
+      logger.error('persistent:load:error', {
+        sessionId: shortId(sessionId),
+        kind: persistentLogKind.value,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      return false
+    } finally {
+      persistentLogLoading.value = false
+      persistentLogRefreshing.value = false
+    }
+  }
+
   async function reloadTransportLogs() {
     transportLog.value = []
     transportLogHasMore.value = false
@@ -326,6 +415,19 @@ export const useLogViewStore = defineStore('log-view', () => {
     return loaded
   }
 
+  async function reloadPersistentLogs() {
+    persistentLog.value = []
+    persistentLogHasMore.value = false
+    persistentLogCursor.value = null
+    stopPersistentFollow()
+    if (!selectedSessionId.value) return false
+    const loaded = await loadPersistentLogs(selectedSessionId.value)
+    if (loaded && transportLogLive.value) {
+      schedulePersistentFollow()
+    }
+    return loaded
+  }
+
   async function refreshTransportLogs() {
     if (!selectedSessionId.value) return false
     const lastCursor = transportLog.value.length > 0 ? transportLog.value[transportLog.value.length - 1]?.cursor ?? null : null
@@ -344,6 +446,12 @@ export const useLogViewStore = defineStore('log-view', () => {
     return loadChannelLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
   }
 
+  async function refreshPersistentLogs() {
+    if (!selectedSessionId.value) return false
+    const lastCursor = persistentLog.value.length > 0 ? persistentLog.value[persistentLog.value.length - 1]?.cursor ?? null : null
+    return loadPersistentLogs(selectedSessionId.value, { cursor: lastCursor, follow: true })
+  }
+
   async function loadOlderTransportLogs() {
     if (!selectedSessionId.value || !transportLogHasMore.value || transportLogCursor.value === null) return false
     return loadTransportLogs(selectedSessionId.value, { cursor: transportLogCursor.value, append: true })
@@ -357,6 +465,11 @@ export const useLogViewStore = defineStore('log-view', () => {
   async function loadOlderChannelLogs() {
     if (!selectedSessionId.value || !channelLogHasMore.value || channelLogCursor.value === null) return false
     return loadChannelLogs(selectedSessionId.value, { cursor: channelLogCursor.value, append: true })
+  }
+
+  async function loadOlderPersistentLogs() {
+    if (!selectedSessionId.value || !persistentLogHasMore.value || persistentLogCursor.value === null) return false
+    return loadPersistentLogs(selectedSessionId.value, { cursor: persistentLogCursor.value, append: true })
   }
 
   function scheduleTransportFollow() {
@@ -389,24 +502,37 @@ export const useLogViewStore = defineStore('log-view', () => {
     }, 1500)
   }
 
+  function schedulePersistentFollow() {
+    stopPersistentFollow()
+    if (!selectedSessionId.value || !transportLogLive.value) return
+    persistentLogFollowing.value = true
+    persistentFollowTimer = window.setTimeout(async () => {
+      await refreshPersistentLogs()
+      schedulePersistentFollow()
+    }, 1500)
+  }
+
   async function setTransportLive(enabled: boolean) {
     transportLogLive.value = enabled
     if (!enabled) {
       stopTransportFollow()
       stopRuntimeFollow()
       stopChannelFollow()
+      stopPersistentFollow()
       return false
     }
     if (!selectedSessionId.value) return false
-    const [transportLoaded, runtimeLoaded, channelLoaded] = await Promise.all([
+    const [transportLoaded, runtimeLoaded, channelLoaded, persistentLoaded] = await Promise.all([
       refreshTransportLogs(),
       refreshRuntimeLogs(),
       refreshChannelLogs(),
+      refreshPersistentLogs(),
     ])
     scheduleTransportFollow()
     scheduleRuntimeFollow()
     scheduleChannelFollow()
-    return transportLoaded || runtimeLoaded || channelLoaded
+    schedulePersistentFollow()
+    return transportLoaded || runtimeLoaded || channelLoaded || persistentLoaded
   }
 
   async function toggleTransportLive() {
@@ -418,8 +544,19 @@ export const useLogViewStore = defineStore('log-view', () => {
     selectedSessionId.value = sessionId
   }
 
-  function selectLogTab(tab: 'transport' | 'runtime' | 'channel') {
+  function selectLogTab(tab: LogTab) {
+    if (tab === 'persistent') {
+      persistentLogKind.value = persistentBaseTab.value
+      selectedLogTab.value = 'persistent'
+      return
+    }
+    persistentBaseTab.value = tab
     selectedLogTab.value = tab
+  }
+
+  function selectPersistentLogKind(kind: PersistentLogKind) {
+    if (persistentLogKind.value === kind) return
+    persistentLogKind.value = kind
   }
 
   watch(selectedSessionId, async (next, prev) => {
@@ -428,7 +565,14 @@ export const useLogViewStore = defineStore('log-view', () => {
         reloadTransportLogs(),
         reloadRuntimeLogs(),
         reloadChannelLogs(),
+        reloadPersistentLogs(),
       ])
+    }
+  })
+
+  watch(persistentLogKind, async (next, prev) => {
+    if (next && next !== prev && selectedSessionId.value) {
+      await reloadPersistentLogs()
     }
   })
 
@@ -436,6 +580,7 @@ export const useLogViewStore = defineStore('log-view', () => {
     sessions,
     selectedSessionId,
     selectedLogTab,
+    persistentLogKind,
     transportLog,
     transportLogHasMore,
     transportLogLoading,
@@ -452,24 +597,34 @@ export const useLogViewStore = defineStore('log-view', () => {
     channelLogLoading,
     channelLogRefreshing,
     channelLogFollowing,
+    persistentLog,
+    persistentLogHasMore,
+    persistentLogLoading,
+    persistentLogRefreshing,
+    persistentLogFollowing,
     ensureSessionsLoaded,
     refreshSessionList,
     startSessionListRefresh,
     stopSessionListRefresh,
     selectSession,
     selectLogTab,
+    selectPersistentLogKind,
     reloadTransportLogs,
     reloadRuntimeLogs,
     reloadChannelLogs,
+    reloadPersistentLogs,
     refreshTransportLogs,
     refreshRuntimeLogs,
     refreshChannelLogs,
+    refreshPersistentLogs,
     loadOlderTransportLogs,
     loadOlderRuntimeLogs,
     loadOlderChannelLogs,
+    loadOlderPersistentLogs,
     stopTransportFollow,
     stopRuntimeFollow,
     stopChannelFollow,
+    stopPersistentFollow,
     setTransportLive,
     toggleTransportLive,
   }

@@ -7,10 +7,12 @@ const logView = useLogViewStore()
 const transportItems = computed(() => logView.transportLog)
 const runtimeItems = computed(() => logView.runtimeLog.filter((item) => item.event.type !== 'sdk.transport'))
 const channelItems = computed(() => logView.channelLog)
+const persistentItems = computed(() => logView.persistentLog)
 const activeItems = computed(() => {
   if (logView.selectedLogTab === 'transport') return transportItems.value
   if (logView.selectedLogTab === 'runtime') return runtimeItems.value
-  return channelItems.value
+  if (logView.selectedLogTab === 'channel') return channelItems.value
+  return persistentItems.value
 })
 const sortedSessions = computed(() => (
   [...logView.sessions].sort((left, right) => {
@@ -163,6 +165,31 @@ function getChannelPayload(item: { event: Record<string, unknown> }): unknown {
   return item.event.payload ?? item.event
 }
 
+function getPersistentRecord(line: string): Record<string, unknown> | null {
+  try {
+    const parsed = JSON.parse(line)
+    return parsed && typeof parsed === 'object' ? parsed as Record<string, unknown> : null
+  } catch {
+    return null
+  }
+}
+
+function getPersistentTimestamp(line: string): string {
+  const record = getPersistentRecord(line)
+  const candidate = typeof record?.timestamp === 'string' ? Date.parse(record.timestamp) : null
+  return typeof candidate === 'number' && Number.isFinite(candidate) ? formatTimestamp(candidate) : '-'
+}
+
+function getPersistentType(line: string): string {
+  const record = getPersistentRecord(line)
+  return typeof record?.type === 'string' ? record.type : '-'
+}
+
+function formatPersistentJson(line: string): string {
+  const record = getPersistentRecord(line)
+  return record ? JSON.stringify(record, null, 2) : line
+}
+
 const liveButtonClass = computed(() => (
   logView.transportLogLive
     ? 'border-emerald-300 bg-emerald-50 text-emerald-700'
@@ -171,7 +198,7 @@ const liveButtonClass = computed(() => (
 
 const liveButtonLabel = computed(() => {
   if (logView.transportLogLive) {
-    return (logView.transportLogRefreshing || logView.runtimeLogRefreshing || logView.channelLogRefreshing) ? 'LIVE · SYNCING' : 'LIVE'
+    return (logView.transportLogRefreshing || logView.runtimeLogRefreshing || logView.channelLogRefreshing || logView.persistentLogRefreshing) ? 'LIVE · SYNCING' : 'LIVE'
   }
   return 'PAUSED'
 })
@@ -190,8 +217,10 @@ async function handleScroll() {
     if (!logView.transportLogHasMore || logView.transportLogLoading) return
   } else if (logView.selectedLogTab === 'runtime') {
     if (!logView.runtimeLogHasMore || logView.runtimeLogLoading) return
-  } else {
+  } else if (logView.selectedLogTab === 'channel') {
     if (!logView.channelLogHasMore || logView.channelLogLoading) return
+  } else {
+    if (!logView.persistentLogHasMore || logView.persistentLogLoading) return
   }
 
   preservingOlderScroll.value = true
@@ -201,7 +230,9 @@ async function handleScroll() {
     ? await logView.loadOlderTransportLogs()
     : logView.selectedLogTab === 'runtime'
       ? await logView.loadOlderRuntimeLogs()
-      : await logView.loadOlderChannelLogs()
+      : logView.selectedLogTab === 'channel'
+        ? await logView.loadOlderChannelLogs()
+        : await logView.loadOlderPersistentLogs()
   if (!loaded) {
     preservingOlderScroll.value = false
     return
@@ -246,6 +277,7 @@ onMounted(() => {
         logView.reloadTransportLogs(),
         logView.reloadRuntimeLogs(),
         logView.reloadChannelLogs(),
+        logView.reloadPersistentLogs(),
       ])
     }
   })
@@ -256,6 +288,7 @@ onBeforeUnmount(() => {
   logView.stopTransportFollow()
   logView.stopRuntimeFollow()
   logView.stopChannelFollow()
+  logView.stopPersistentFollow()
 })
 </script>
 
@@ -264,14 +297,14 @@ onBeforeUnmount(() => {
     <div class="mx-auto flex h-full min-h-0 w-full max-w-7xl flex-col gap-2">
       <div class="border-b border-gray-200 pb-2">
         <h2 class="text-sm font-semibold text-gray-900">SDK logs</h2>
-        <p class="mt-0.5 text-[11px] text-gray-500">同一 session 下可切换查看 transport、runtime 与 channel 日志。</p>
+        <p class="mt-0.5 text-[11px] text-gray-500">同一 session 下可切换查看 transport、runtime、channel 与 persistent 日志。</p>
       </div>
 
       <div class="flex items-center justify-between gap-2 pb-1">
         <div class="flex min-w-0 items-center gap-2">
           <select
             :value="logView.selectedSessionId || ''"
-            class="min-w-[32rem] max-w-[40rem] rounded border border-gray-300 bg-white px-2 py-1 font-mono text-[11px] text-gray-700"
+            class="min-w-[22rem] max-w-[28rem] rounded border border-gray-300 bg-white px-2 py-1 font-mono text-[11px] text-gray-700"
             @change="logView.selectSession(($event.target as HTMLSelectElement).value)"
           >
             <option value="" disabled>选择 session</option>
@@ -301,6 +334,13 @@ onBeforeUnmount(() => {
             >
               Channel
             </button>
+            <button
+              class="rounded px-2 py-1"
+              :class="logView.selectedLogTab === 'persistent' ? 'bg-gray-900 text-white' : 'text-gray-600 hover:bg-gray-100'"
+              @click="logView.selectLogTab('persistent')"
+            >
+              Persistent
+            </button>
           </div>
           <div class="truncate text-[11px] text-gray-500">
             <span class="text-gray-400">session:</span>
@@ -310,7 +350,7 @@ onBeforeUnmount(() => {
         <button
           class="rounded border px-2 py-1 text-[11px] font-semibold tracking-wide disabled:cursor-not-allowed disabled:opacity-50"
           :class="liveButtonClass"
-          :disabled="!logView.selectedSessionId || (logView.selectedLogTab === 'transport' ? logView.transportLogLoading : logView.selectedLogTab === 'runtime' ? logView.runtimeLogLoading : logView.channelLogLoading)"
+          :disabled="!logView.selectedSessionId || (logView.selectedLogTab === 'transport' ? logView.transportLogLoading : logView.selectedLogTab === 'runtime' ? logView.runtimeLogLoading : logView.selectedLogTab === 'channel' ? logView.channelLogLoading : logView.persistentLogLoading)"
           @click="logView.toggleTransportLive"
         >
           {{ liveButtonLabel }}
@@ -410,7 +450,7 @@ onBeforeUnmount(() => {
           </div>
         </template>
 
-        <template v-else>
+        <template v-else-if="logView.selectedLogTab === 'channel'">
           <div v-if="channelItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
             No channel logs yet.
           </div>
@@ -449,6 +489,32 @@ onBeforeUnmount(() => {
                   <pre class="mt-1 overflow-x-auto border border-gray-200 bg-gray-950 px-2 py-2 text-[11px] text-gray-100">{{ stringifyStructuredValue(getChannelPayload(item)) }}</pre>
                 </details>
               </div>
+            </div>
+          </div>
+        </template>
+
+        <template v-else>
+          <div v-if="persistentItems.length === 0" class="flex h-full items-center justify-center p-6 text-center text-sm text-gray-500">
+            No persistent logs yet.
+          </div>
+
+          <div v-else ref="scrollContainer" class="h-full overflow-auto" @scroll="handleScroll">
+            <div class="sticky top-0 z-10 grid grid-cols-[28ch_20ch_minmax(36ch,1fr)] gap-3 border-b border-gray-200 bg-gray-50 px-3 py-2 text-[10px] uppercase tracking-wide text-gray-500">
+              <div>Time</div>
+              <div>Type</div>
+              <div>JSON</div>
+            </div>
+            <div
+              v-for="item in persistentItems"
+              :key="`persistent-${logView.persistentLogKind}-${item.cursor}`"
+              class="grid grid-cols-[28ch_20ch_minmax(36ch,1fr)] gap-3 border-b border-gray-100 px-3 py-2 text-[11px] leading-5 transition-colors last:border-b-0 hover:bg-gray-50"
+            >
+              <div class="shrink-0 whitespace-nowrap text-gray-500">{{ getPersistentTimestamp(item.line) }}</div>
+              <div class="truncate text-gray-600">{{ getPersistentType(item.line) }}</div>
+              <details class="rounded border border-gray-200 bg-gray-50/70 px-2 py-1">
+                <summary class="cursor-pointer text-gray-600 hover:text-gray-800">Formatted JSON</summary>
+                <pre class="mt-1 overflow-x-auto whitespace-pre text-gray-800">{{ formatPersistentJson(item.line) }}</pre>
+              </details>
             </div>
           </div>
         </template>

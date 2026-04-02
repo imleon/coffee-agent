@@ -1,10 +1,13 @@
-import { mkdir, appendFile, readFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { mkdir, appendFile, readFile, readdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import type {
   ChannelLogEvent,
   RunnerRuntimeEvent,
   SessionChannelLogEntry,
   SessionChannelLogPage,
+  SessionPersistentLogEntry,
+  SessionPersistentLogPage,
   SessionRuntimeLogEntry,
   SessionRuntimeLogPage,
   SessionTransportLogEntry,
@@ -12,6 +15,7 @@ import type {
   SdkTransportEvent,
 } from '../shared/message-types.js'
 import { sanitizeValue } from './logger.js'
+import { CONFIG } from './config.js'
 
 const LOG_DIR = './data/logs'
 const LEGACY_TRANSPORT_LOG_DIR = './data/transport-logs'
@@ -73,6 +77,7 @@ function sanitizeChannelEvent(event: ChannelLogEvent): ChannelLogEvent {
     ...event,
     ...(event.payloadSummary ? { payloadSummary: String(sanitizeValue(event.payloadSummary)) } : {}),
     ...(event.payload !== undefined ? { payload: sanitizeValue(event.payload) } : {}),
+    ...(event.rawPayload !== undefined ? { rawPayload: event.rawPayload } : {}),
   }
 }
 
@@ -123,6 +128,26 @@ async function readFirstExistingLogFile(filePaths: string[]): Promise<string | n
       throw error
     }
   }
+  return null
+}
+
+async function findClaudeSessionFile(sessionId: string): Promise<string | null> {
+  const projectsDir = resolve(homedir(), '.claude/projects')
+  let entries: string[] = []
+  try {
+    entries = await readdir(projectsDir)
+  } catch (error) {
+    const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: string }).code) : ''
+    if (code === 'ENOENT') return null
+    throw error
+  }
+
+  for (const entry of entries) {
+    const match = join(projectsDir, entry, `${sessionId}.jsonl`)
+    const content = await readFirstExistingLogFile([match])
+    if (content !== null) return match
+  }
+
   return null
 }
 
@@ -274,6 +299,35 @@ function parseChannelLogLine(line: string, cursor: number): SessionChannelLogEnt
   } catch {
     return null
   }
+}
+
+function readPersistentLogLine(line: string, cursor: number): SessionPersistentLogEntry {
+  return {
+    cursor,
+    line,
+  }
+}
+
+export async function readSessionPersistentLogs(
+  sessionId: string,
+  kind: LogFileKind,
+  cursor?: number | null,
+  limit: number = DEFAULT_TRANSPORT_PAGE_SIZE,
+  follow: boolean = false,
+): Promise<SessionPersistentLogPage> {
+  const safeSessionId = sanitizeSessionId(sessionId)
+  if (!safeSessionId) {
+    return { items: [], hasMore: false, nextCursor: null }
+  }
+
+  const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(MAX_TRANSPORT_PAGE_SIZE, Math.floor(limit))) : DEFAULT_TRANSPORT_PAGE_SIZE
+  const sessionFilePath = await findClaudeSessionFile(safeSessionId)
+  const content = sessionFilePath ? await readFirstExistingLogFile([sessionFilePath]) : null
+  if (content === null) {
+    return { items: [], hasMore: false, nextCursor: null }
+  }
+
+  return paginateLogLines(content, cursor, safeLimit, follow, readPersistentLogLine)
 }
 
 export async function readSessionTransportLogs(

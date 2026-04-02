@@ -45,12 +45,37 @@ export interface RunStateSdkEventItem {
   timestamp: number
 }
 
-export interface HistoryTimelineItem {
+export interface HistoryUserMessageTimelineItem {
+  kind: 'history-user-message'
+  key: string
+  message: HistoryMessage
+  timestamp: number
+}
+
+export interface HistorySingleMessageTimelineItem {
   kind: 'history-message'
   key: string
   message: HistoryMessage
   timestamp: number
 }
+
+export interface HistoryAssistantThreadItem {
+  key: string
+  message: HistoryMessage
+  depth: number
+  timestamp: number
+}
+
+export interface HistoryAssistantThreadTimelineItem {
+  kind: 'history-assistant-thread'
+  key: string
+  rootMessage: HistoryMessage
+  items: HistoryAssistantThreadItem[]
+  timestamp: number
+  executionDurationMs: number | null
+}
+
+export type HistoryTimelineItem = HistoryUserMessageTimelineItem | HistorySingleMessageTimelineItem | HistoryAssistantThreadTimelineItem
 
 export type TimelineItem = SdkTimelineItem | HistoryTimelineItem
 
@@ -73,6 +98,158 @@ const OPTIMISTIC_USER_MATCH_WINDOW_MS = 30_000
 type HistoryMessage = SessionMessage & {
   optimistic?: boolean
   localId?: string
+}
+
+function getHistoryMessageUuid(message: HistoryMessage): string | null {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object') return null
+  return typeof (raw as Record<string, unknown>).uuid === 'string' ? (raw as Record<string, unknown>).uuid as string : null
+}
+
+function getHistoryMessageParentUuid(message: HistoryMessage): string | null {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object') return null
+  return typeof (raw as Record<string, unknown>).parentUuid === 'string' ? (raw as Record<string, unknown>).parentUuid as string : null
+}
+
+function getHistoryMessageTimestamp(message: HistoryMessage, fallback: number): number {
+  return typeof message.timestamp === 'number' ? message.timestamp : fallback
+}
+
+function isAssistantHistoryMessage(message: HistoryMessage): boolean {
+  return message.role === 'assistant'
+}
+
+function getHistoryMessageKey(message: HistoryMessage, index: number): string {
+  return getHistoryMessageUuid(message) ?? `history-${index}`
+}
+
+function isAssistantThreadRoot(message: HistoryMessage, messagesByUuid: Map<string, HistoryMessage>): boolean {
+  if (!isAssistantHistoryMessage(message)) return false
+  const parentUuid = getHistoryMessageParentUuid(message)
+  if (!parentUuid) return true
+  const parent = messagesByUuid.get(parentUuid)
+  return !parent || parent.role !== 'assistant'
+}
+
+function getAssistantThreadExecutionDuration(
+  rootMessage: HistoryMessage,
+  lastTimestamp: number,
+  messagesByUuid: Map<string, HistoryMessage>,
+  fallbackIndex: number,
+): number | null {
+  const parentUuid = getHistoryMessageParentUuid(rootMessage)
+  if (!parentUuid) return null
+
+  const parentMessage = messagesByUuid.get(parentUuid)
+  if (!parentMessage || parentMessage.role !== 'user') return null
+
+  const parentTimestamp = getHistoryMessageTimestamp(parentMessage, fallbackIndex)
+  const duration = lastTimestamp - parentTimestamp
+  return duration >= 0 ? duration : null
+}
+
+function buildHistoryTimeline(messages: HistoryMessage[]): HistoryTimelineItem[] {
+  const messagesByUuid = new Map<string, HistoryMessage>()
+  const messageIndexByUuid = new Map<string, number>()
+  const childrenByParent = new Map<string, HistoryMessage[]>()
+
+  for (const [index, message] of messages.entries()) {
+    const uuid = getHistoryMessageUuid(message)
+    if (!uuid) continue
+    messagesByUuid.set(uuid, message)
+    messageIndexByUuid.set(uuid, index)
+  }
+
+  for (const message of messages) {
+    const parentUuid = getHistoryMessageParentUuid(message)
+    if (!parentUuid) continue
+    const parent = messagesByUuid.get(parentUuid)
+    if (!parent) continue
+    const siblings = childrenByParent.get(parentUuid) ?? []
+    siblings.push(message)
+    childrenByParent.set(parentUuid, siblings)
+  }
+
+  const assistantItemsByRootUuid = new Map<string, HistoryAssistantThreadItem[]>()
+  const assistantCoveredUuids = new Set<string>()
+
+  const appendAssistantThreadItems = (message: HistoryMessage, depth: number, bucket: HistoryAssistantThreadItem[]) => {
+    const uuid = getHistoryMessageUuid(message)
+    const fallbackIndex = typeof uuid === 'string' ? (messageIndexByUuid.get(uuid) ?? bucket.length) : bucket.length
+    if (isAssistantHistoryMessage(message)) {
+      if (uuid) assistantCoveredUuids.add(uuid)
+      bucket.push({
+        key: `${getHistoryMessageKey(message, fallbackIndex)}-${depth}`,
+        message,
+        depth,
+        timestamp: getHistoryMessageTimestamp(message, fallbackIndex),
+      })
+    }
+
+    if (!uuid) return
+    const children = childrenByParent.get(uuid) ?? []
+    for (const child of children) {
+      if (!isAssistantHistoryMessage(child)) continue
+      appendAssistantThreadItems(child, depth + 1, bucket)
+    }
+  }
+
+  for (const message of messages) {
+    if (!isAssistantThreadRoot(message, messagesByUuid)) continue
+    const rootUuid = getHistoryMessageUuid(message)
+    const fallbackIndex = typeof rootUuid === 'string' ? (messageIndexByUuid.get(rootUuid) ?? 0) : 0
+    const items: HistoryAssistantThreadItem[] = []
+    appendAssistantThreadItems(message, 0, items)
+    if (!items.length) continue
+    assistantItemsByRootUuid.set(getHistoryMessageKey(message, fallbackIndex), items)
+  }
+
+  const timeline: HistoryTimelineItem[] = []
+
+  for (const [index, message] of messages.entries()) {
+    const timestamp = getHistoryMessageTimestamp(message, index)
+    const key = getHistoryMessageKey(message, index)
+
+    if (message.role === 'user') {
+      timeline.push({
+        kind: 'history-user-message',
+        key: `history-user-${key}`,
+        message,
+        timestamp,
+      })
+      continue
+    }
+
+    if (isAssistantThreadRoot(message, messagesByUuid)) {
+      const items = assistantItemsByRootUuid.get(key) ?? []
+      if (!items.length) continue
+      const lastTimestamp = items[items.length - 1]?.timestamp ?? timestamp
+      timeline.push({
+        kind: 'history-assistant-thread',
+        key: `history-assistant-thread-${key}`,
+        rootMessage: message,
+        items,
+        timestamp: lastTimestamp,
+        executionDurationMs: getAssistantThreadExecutionDuration(message, lastTimestamp, messagesByUuid, index),
+      })
+      continue
+    }
+
+    if (isAssistantHistoryMessage(message)) {
+      const uuid = getHistoryMessageUuid(message)
+      if (uuid && assistantCoveredUuids.has(uuid)) continue
+    }
+
+    timeline.push({
+      kind: 'history-message',
+      key: `history-${key}`,
+      message,
+      timestamp,
+    })
+  }
+
+  return timeline
 }
 
 function normalizeSession(item: any): SessionSummary {
@@ -161,12 +338,7 @@ export const useSessionStore = defineStore('session', () => {
       }))
   )
   const historyTimeline = computed<HistoryTimelineItem[]>(() =>
-    historyMessages.value.map((message, index) => ({
-      kind: 'history-message',
-      key: `history-${index}`,
-      message,
-      timestamp: typeof message.timestamp === 'number' ? message.timestamp : index,
-    }))
+    buildHistoryTimeline(historyMessages.value)
   )
   const timeline = computed<TimelineItem[]>(() => {
     const items = [...historyTimeline.value, ...liveSdkTimeline.value]
@@ -177,19 +349,23 @@ export const useSessionStore = defineStore('session', () => {
         return left.event.sequence - right.event.sequence
       }
 
-      if (left.kind === 'history-message' && right.kind === 'history-message') {
-        return left.key.localeCompare(right.key)
+      if (left.kind !== 'sdk-message' && right.kind !== 'sdk-message') {
+        return left.timestamp - right.timestamp || left.key.localeCompare(right.key)
       }
 
-      const leftRole = left.kind === 'history-message'
-        ? left.message.role
-        : getTimelineMessageFromEvent(left.event)?.role
-      const rightRole = right.kind === 'history-message'
-        ? right.message.role
-        : getTimelineMessageFromEvent(right.event)?.role
+      const leftRole = left.kind === 'sdk-message'
+        ? getTimelineMessageFromEvent(left.event)?.role
+        : left.kind === 'history-message'
+          ? left.message.role
+          : 'assistant'
+      const rightRole = right.kind === 'sdk-message'
+        ? getTimelineMessageFromEvent(right.event)?.role
+        : right.kind === 'history-message'
+          ? right.message.role
+          : 'assistant'
 
       if (leftRole === rightRole) {
-        return left.kind === 'history-message' ? -1 : 1
+        return left.kind === 'sdk-message' ? 1 : -1
       }
 
       if (leftRole === 'user') return -1

@@ -3,9 +3,20 @@ import { CONFIG } from './config.js'
 import { createLogger } from './logger.js'
 import { appendSessionChannelLog } from './transport-logs.js'
 import { SessionBindingStore } from './session-bindings.js'
-import type { ChannelInboundMessage, ChannelOutboundMessage, PendingInteraction, SessionEvent } from '../shared/message-types.js'
+import type {
+  ChannelInboundMessage,
+  ChannelOutboundMessage,
+  LarkStreamingState,
+  PendingInteraction,
+  SessionEvent,
+} from '../shared/message-types.js'
 import type { RunCoordinator, RunRecord } from './run-coordinator.js'
-import { buildContentFromBlocks, normalizeSdkEnvelopeMessage } from '../shared/transcript-normalizer.js'
+import {
+  buildContentFromBlocks,
+  extractStructuredContentFromBlocks,
+  hasRenderableTranscriptContent,
+  normalizeSdkEnvelopeMessage,
+} from '../shared/transcript-normalizer.js'
 
 const logger = createLogger('lark-adapter')
 const DEDUPE_TTL_MS = 10 * 60 * 1000
@@ -14,10 +25,13 @@ let clientInstance: any | null = null
 let dispatcherInstance: any | null = null
 let cardActionHandlerInstance: any | null = null
 let wsClientInstance: any | null = null
+let wsClientCardPatched = false
 let wsStartPromise: Promise<void> | null = null
 const bindings = new SessionBindingStore()
 const processedMessageIds = new Map<string, number>()
 const processedActionKeys = new Map<string, number>()
+const larkStreamingStates = new Map<string, LarkStreamingState>()
+const STREAMING_CARD_ELEMENT_ID = 'streaming_content'
 
 export type LarkInboundEvent = {
   conversationKey: string
@@ -26,12 +40,14 @@ export type LarkInboundEvent = {
   platformMessageId?: string
 }
 
-export type LarkOutboundDelivery = {
+type LarkOutboundDelivery = {
   conversationKey: string
   text?: string
   card?: unknown
   runId?: string
   sessionId?: string
+  mode?: 'create' | 'stream' | 'finalize' | 'fallback'
+  state?: LarkStreamingState
 }
 
 type LarkInteractionCommand =
@@ -171,7 +187,47 @@ function getLarkWsClient(): any | null {
     appSecret: CONFIG.lark.appSecret,
     loggerLevel: Lark.LoggerLevel.info,
   })
+
+  patchLarkWsClientForCardCallbacks(wsClientInstance)
   return wsClientInstance
+}
+
+function patchLarkWsClientForCardCallbacks(wsClient: any): void {
+  if (wsClientCardPatched) return
+  const originalHandleEventData = wsClient?.handleEventData
+  if (typeof originalHandleEventData !== 'function') return
+
+  wsClient.handleEventData = async function patchedHandleEventData(data: any): Promise<void> {
+    const headers = Array.isArray(data?.headers)
+      ? data.headers.reduce((acc: Record<string, string>, cur: { key?: string; value?: string }) => {
+          if (typeof cur?.key === 'string' && typeof cur?.value === 'string') {
+            acc[cur.key] = cur.value
+          }
+          return acc
+        }, {})
+      : {}
+    const frameType = headers.type
+
+    if (frameType === 'card') {
+      const payload = data?.payload instanceof Uint8Array ? data.payload : null
+      if (payload) {
+        const payloadString = new TextDecoder('utf-8').decode(payload)
+        const messageTypeHeader = data.headers.find((entry: { key?: string }) => entry?.key === 'type')
+        if (messageTypeHeader) {
+          messageTypeHeader.value = 'event'
+        }
+        data.payload = new TextEncoder().encode(JSON.stringify({
+          schema: '2.0',
+          header: { event_type: 'card.action.trigger' },
+          event: JSON.parse(payloadString),
+        }))
+      }
+    }
+
+    return await originalHandleEventData.call(this, data)
+  }
+
+  wsClientCardPatched = true
 }
 
 export async function startLarkLongConnection(coordinator: RunCoordinator): Promise<void> {
@@ -208,6 +264,7 @@ async function appendLarkChannelLog(params: {
   platformMessageId?: string
   payloadSummary?: string
   payload?: unknown
+  rawPayload?: unknown
 }): Promise<void> {
   if (typeof params.sessionId !== 'string' || !params.sessionId) return
   await appendSessionChannelLog(params.sessionId, {
@@ -219,6 +276,7 @@ async function appendLarkChannelLog(params: {
     ...(params.platformMessageId ? { platformMessageId: params.platformMessageId } : {}),
     ...(params.payloadSummary ? { payloadSummary: params.payloadSummary } : {}),
     ...(params.payload !== undefined ? { payload: params.payload } : {}),
+    ...(params.rawPayload !== undefined ? { rawPayload: params.rawPayload } : {}),
   }, params.runId)
 }
 
@@ -292,12 +350,17 @@ function buildPermissionCard(runId: string, interaction: Extract<PendingInteract
     },
     elements: [
       {
-        tag: 'markdown',
-        content: description,
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: description,
+        },
+      },
+      {
+        tag: 'hr',
       },
       {
         tag: 'action',
-        layout: 'bisected',
         actions: [
           {
             tag: 'button',
@@ -311,16 +374,6 @@ function buildPermissionCard(runId: string, interaction: Extract<PendingInteract
               runId,
               interactionId: interaction.id,
               decision: 'approve',
-            },
-            confirm: {
-              title: {
-                tag: 'plain_text',
-                content: 'Approve permission',
-              },
-              text: {
-                tag: 'plain_text',
-                content: '确认允许这次操作继续执行吗？',
-              },
             },
           },
           {
@@ -336,29 +389,175 @@ function buildPermissionCard(runId: string, interaction: Extract<PendingInteract
               interactionId: interaction.id,
               decision: 'deny',
             },
-            confirm: {
-              title: {
-                tag: 'plain_text',
-                content: 'Deny permission',
-              },
-              text: {
-                tag: 'plain_text',
-                content: '确认拒绝这次操作吗？',
-              },
-            },
-          },
-        ],
-      },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'plain_text',
-            content: `Fallback: /permission ${runId} ${interaction.id} approve|deny`,
           },
         ],
       },
     ],
+  }
+}
+
+function buildPermissionResolvedCard(decision: 'approve' | 'deny', ok: boolean): Lark.InteractiveCard {
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: false,
+    },
+    header: {
+      template: ok ? (decision === 'approve' ? 'green' : 'red') : 'grey',
+      title: {
+        tag: 'plain_text',
+        content: ok
+          ? `Permission ${decision}`
+          : 'Permission unavailable',
+      },
+    },
+    elements: [
+      {
+        tag: 'div',
+        text: {
+          tag: 'lark_md',
+          content: ok
+            ? `This permission has been **${decision}**.`
+            : 'No matching active run was found for this permission action.',
+        },
+      },
+    ],
+  }
+}
+
+function buildAssistantStreamingCard(params: {
+  title?: string
+  answerText: string
+  thinkingText?: string
+  toolCalls?: string[]
+  toolResults?: string[]
+  isFinal?: boolean
+}): Lark.InteractiveCard {
+  const mainContent = params.answerText || params.thinkingText || (params.isFinal ? 'Done.' : 'Thinking...')
+  const elements: unknown[] = [
+    {
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: mainContent,
+      },
+      element_id: STREAMING_CARD_ELEMENT_ID,
+    },
+  ]
+
+  if (params.thinkingText && params.answerText) {
+    elements.unshift({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: `**Thinking**\n${params.thinkingText}`,
+      },
+    })
+  }
+
+  if (params.toolCalls && params.toolCalls.length > 0) {
+    elements.push({
+      tag: 'note',
+      elements: params.toolCalls.map((item) => ({
+        tag: 'plain_text',
+        content: item,
+      })),
+    })
+  }
+
+  if (params.toolResults && params.toolResults.length > 0) {
+    elements.push({
+      tag: 'div',
+      text: {
+        tag: 'lark_md',
+        content: params.toolResults.join('\n\n'),
+      },
+    })
+  }
+
+  return {
+    config: {
+      wide_screen_mode: true,
+      update_multi: true,
+    },
+    header: {
+      template: params.isFinal ? 'green' : 'blue',
+      title: {
+        tag: 'plain_text',
+        content: params.title || (params.isFinal ? 'Claude response' : 'Claude is responding'),
+      },
+    },
+    elements: elements as unknown as Lark.InteractiveCard['elements'],
+  }
+}
+
+function getStreamingState(runId: string): LarkStreamingState | null {
+  return larkStreamingStates.get(runId) ?? null
+}
+
+function setStreamingState(state: LarkStreamingState): LarkStreamingState {
+  larkStreamingStates.set(state.runId, state)
+  return state
+}
+
+function clearStreamingState(runId: string): void {
+  larkStreamingStates.delete(runId)
+}
+
+function buildStreamingState(record: RunRecord): LarkStreamingState {
+  return setStreamingState({
+    runId: record.runId,
+    conversationKey: record.conversationKey,
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+    mode: 'interactive',
+    phase: 'idle',
+    accumulatedText: '',
+    sequence: 0,
+  })
+}
+
+function resolveStreamingState(record: RunRecord): LarkStreamingState {
+  return getStreamingState(record.runId) ?? buildStreamingState(record)
+}
+
+function buildStructuredAssistantCardState(event: Extract<SessionEvent, { type: 'session.sdk.message' }>, record: RunRecord): LarkStreamingState | null {
+  const parsed = event.parsed ?? normalizeSdkEnvelopeMessage(event.payload)
+  if (!parsed || parsed.role !== 'assistant' || !Array.isArray(parsed.blocks) || parsed.blocks.length === 0) {
+    return null
+  }
+  if (!hasRenderableTranscriptContent(parsed.blocks)) {
+    return null
+  }
+
+  const structured = extractStructuredContentFromBlocks(parsed.blocks)
+  const segments = [
+    structured.answerText,
+    ...structured.toolResults.map((item) => item.output).filter(Boolean),
+  ].filter(Boolean)
+  const accumulatedText = segments.join('\n\n').trim() || buildContentFromBlocks(parsed.blocks).trim()
+  const current = resolveStreamingState(record)
+
+  return setStreamingState({
+    ...current,
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+    mode: current.mode,
+    phase: 'streaming',
+    accumulatedText,
+    sequence: event.sequence,
+    lastMessageCursor: event.sequence,
+  })
+}
+
+
+function buildPermissionCardKitState(record: RunRecord): LarkStreamingState {
+  return {
+    runId: record.runId,
+    conversationKey: record.conversationKey,
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+    mode: 'cardkit',
+    phase: 'completed',
+    accumulatedText: '',
+    sequence: 0,
   }
 }
 
@@ -370,6 +569,12 @@ function createLarkEventDispatcher(coordinator: RunCoordinator): any {
     'im.message.receive_v1': async (data: any) => {
       await handleLarkMessageEvent(coordinator, data)
       return undefined
+    },
+    'im.message.message_read_v1': async () => {
+      return undefined
+    },
+    'card.action.trigger': async (data: any) => {
+      return await handleLarkCardActionEvent(coordinator, data)
     },
   })
 }
@@ -414,6 +619,30 @@ async function handleLarkMessageEvent(coordinator: RunCoordinator, data: any): P
     platformMessageId,
     payloadSummary: text,
   })
+}
+
+async function handleLarkCardActionEvent(coordinator: RunCoordinator, data: Lark.InteractiveCardActionEvent): Promise<unknown> {
+  const cardEvent = data as Lark.InteractiveCardActionEvent & { open_chat_id?: string }
+  const runId = typeof data?.action?.value?.runId === 'string' ? data.action.value.runId : undefined
+  const actionType = typeof data?.action?.value?.actionType === 'string' ? data.action.value.actionType : undefined
+  const run = runId ? coordinator.getRun(runId) : null
+
+  await appendLarkChannelLog({
+    sessionId: run?.sessionId,
+    runId,
+    direction: 'inbound',
+    eventName: 'card-action.received',
+    conversationKey: typeof cardEvent.open_chat_id === 'string' ? cardEvent.open_chat_id : undefined,
+    platformMessageId: typeof data?.open_message_id === 'string' ? data.open_message_id : undefined,
+    payloadSummary: actionType || 'card-action',
+    payload: {
+      openMessageId: data?.open_message_id,
+      actionType,
+      decision: data?.action?.value?.decision,
+    },
+  })
+
+  return await invokeLarkCardAction(coordinator, data, { source: 'ws' })
 }
 
 function getLarkDispatcher(coordinator: RunCoordinator): any {
@@ -471,29 +700,7 @@ function getLarkCardActionHandler(coordinator: RunCoordinator): any {
           ? `Permission ${decision} recorded.`
           : 'No matching active run for that permission action.',
       },
-      card: {
-        config: {
-          wide_screen_mode: true,
-          update_multi: false,
-        },
-        header: {
-          template: ok ? (decision === 'approve' ? 'green' : 'red') : 'grey',
-          title: {
-            tag: 'plain_text',
-            content: ok
-              ? `Permission ${decision}`
-              : 'Permission unavailable',
-          },
-        },
-        elements: [
-          {
-            tag: 'markdown',
-            content: ok
-              ? `This permission has been **${decision}**.`
-              : 'No matching active run was found for this permission action.',
-          },
-        ],
-      },
+      card: buildPermissionResolvedCard(decision, ok),
     }
   })
 
@@ -506,7 +713,11 @@ export async function invokeLarkEvent(coordinator: RunCoordinator, body: unknown
   return dispatcher.invoke(assigned)
 }
 
-export async function invokeLarkCardAction(coordinator: RunCoordinator, body: unknown, headers: Record<string, string>): Promise<unknown> {
+export async function invokeLarkCardAction(
+  coordinator: RunCoordinator,
+  body: unknown,
+  headers: Record<string, string> = {},
+): Promise<unknown> {
   const handler = getLarkCardActionHandler(coordinator)
   const assigned = Object.assign(Object.create({ headers }), body as object)
   return handler.invoke(assigned)
@@ -540,11 +751,15 @@ export async function sendLarkTextMessage(conversationKey: string, text: string)
   }
 }
 
-async function sendLarkCardMessage(conversationKey: string, card: unknown): Promise<{ delivered: boolean; response?: unknown; error?: string }> {
+async function sendLarkCardMessage(
+  conversationKey: string,
+  card: unknown,
+): Promise<{ delivered: boolean; response?: unknown; error?: string; content: string; responseContent?: string }> {
   const client = getLarkClient()
+  const content = JSON.stringify(card)
   if (!client) {
     logger.warn('lark:send:missing-config', { conversationKey })
-    return { delivered: false, error: 'Lark client is not configured' }
+    return { delivered: false, error: 'Lark client is not configured', content }
   }
 
   try {
@@ -554,14 +769,165 @@ async function sendLarkCardMessage(conversationKey: string, card: unknown): Prom
       },
       data: {
         receive_id: conversationKey,
-        content: JSON.stringify(card),
         msg_type: 'interactive',
+        content,
+      },
+    })
+    return {
+      delivered: true,
+      response,
+      content,
+      responseContent: JSON.stringify(response),
+    }
+  } catch (error) {
+    logger.error('lark:send-card:error', {
+      conversationKey,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return {
+      delivered: false,
+      error: error instanceof Error ? error.message : String(error),
+      content,
+    }
+  }
+}
+
+async function sendLarkCardKitMessage(
+  conversationKey: string,
+  card: unknown,
+): Promise<{ delivered: boolean; cardId?: string; messageId?: string; response?: unknown; error?: string }> {
+  const client = getLarkClient()
+  if (!client) {
+    logger.warn('lark:send:missing-config', { conversationKey })
+    return { delivered: false, error: 'Lark client is not configured' }
+  }
+
+  try {
+    const cardResponse = await client.cardkit.v1.card.create({
+      data: {
+        type: 'card_json',
+        data: JSON.stringify(card),
+      },
+    })
+    const cardId = typeof cardResponse?.data?.card_id === 'string'
+      ? cardResponse.data.card_id
+      : undefined
+    if (!cardId) {
+      return { delivered: false, response: cardResponse, error: 'CardKit card_id missing' }
+    }
+
+    const response = await client.im.message.create({
+      params: {
+        receive_id_type: 'chat_id',
+      },
+      data: {
+        receive_id: conversationKey,
+        msg_type: 'interactive',
+        content: JSON.stringify({
+          type: 'card',
+          data: { card_id: cardId },
+        }),
+      },
+    })
+
+    return {
+      delivered: true,
+      cardId,
+      messageId: typeof response?.data?.message_id === 'string' ? response.data.message_id : undefined,
+      response,
+    }
+  } catch (error) {
+    logger.error('lark:send-cardkit:error', {
+      conversationKey,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return { delivered: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function updateLarkCardKitStreamingContent(
+  state: LarkStreamingState,
+  card: ReturnType<typeof buildAssistantStreamingCard>,
+): Promise<{ delivered: boolean; error?: string; response?: unknown }> {
+  const client = getLarkClient()
+  if (!client || !state.cardId) {
+    return { delivered: false, error: 'Lark CardKit is not configured' }
+  }
+
+  try {
+    const markdownElement = Array.isArray(card.elements)
+      ? card.elements.find((element) => {
+          if (!element || typeof element !== 'object') return false
+          return (element as { tag?: unknown }).tag === 'div'
+        })
+      : null
+    const text = markdownElement && typeof markdownElement === 'object'
+      ? ((markdownElement as { text?: unknown }).text as Record<string, unknown> | undefined)
+      : undefined
+    const content = text && typeof text.content === 'string' ? text.content : state.accumulatedText
+
+    const response = await client.cardkit.v1.cardElement.content({
+      data: {
+        content,
+        sequence: Math.max(1, state.sequence),
+      },
+      path: {
+        card_id: state.cardId,
+        element_id: STREAMING_CARD_ELEMENT_ID,
       },
     })
     return { delivered: true, response }
   } catch (error) {
-    logger.error('lark:send-card:error', {
-      conversationKey,
+    logger.error('lark:cardkit:stream:error', {
+      runId: state.runId,
+      cardId: state.cardId,
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return { delivered: false, error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
+async function finalizeLarkCardKit(
+  state: LarkStreamingState,
+  card: ReturnType<typeof buildAssistantStreamingCard>,
+): Promise<{ delivered: boolean; error?: string; response?: unknown }> {
+  const client = getLarkClient()
+  if (!client || !state.cardId) {
+    return { delivered: false, error: 'Lark CardKit is not configured' }
+  }
+
+  try {
+    await client.cardkit.v1.card.settings({
+      data: {
+        settings: JSON.stringify({ streaming_mode: false }),
+        sequence: Math.max(1, state.sequence),
+      },
+      path: {
+        card_id: state.cardId,
+      },
+    })
+    const response = await client.cardkit.v1.card.update({
+      data: {
+        card: {
+          type: 'card_json',
+          data: JSON.stringify({
+            schema: '2.0',
+            config: card.config,
+            header: card.header,
+            body: { elements: card.elements },
+          }),
+        },
+        sequence: Math.max(2, state.sequence + 1),
+      },
+      path: {
+        card_id: state.cardId,
+      },
+    })
+    return { delivered: true, response }
+  } catch (error) {
+    logger.error('lark:cardkit:finalize:error', {
+      runId: state.runId,
+      cardId: state.cardId,
       error: error instanceof Error ? error.message : String(error),
     })
     return { delivered: false, error: error instanceof Error ? error.message : String(error) }
@@ -622,25 +988,102 @@ export function extractLarkAssistantText(event: Extract<SessionEvent, { type: 's
   const parsed = event.parsed ?? normalizeSdkEnvelopeMessage(event.payload)
   if (!parsed || parsed.role !== 'assistant') return ''
   if (Array.isArray(parsed.blocks) && parsed.blocks.length > 0) {
-    return buildContentFromBlocks(parsed.blocks).trim()
+    const structured = extractStructuredContentFromBlocks(parsed.blocks)
+    return [
+      structured.thinkingText ? `Thinking:\n${structured.thinkingText}` : '',
+      structured.answerText,
+      ...structured.toolCalls.map((item) => `[Tool call] ${item.name}`),
+      ...structured.toolResults.map((item) => item.output ? `[Tool result]\n${item.output}` : '[Tool result]'),
+    ].filter(Boolean).join('\n\n').trim()
   }
   return parsed.content.trim()
+}
+
+function buildAssistantStreamingDelivery(
+  event: Extract<SessionEvent, { type: 'session.sdk.message' }>,
+  record: RunRecord,
+): LarkOutboundDelivery[] {
+  const parsed = event.parsed ?? normalizeSdkEnvelopeMessage(event.payload)
+  if (!parsed || parsed.role !== 'assistant' || !Array.isArray(parsed.blocks) || parsed.blocks.length === 0) {
+    return []
+  }
+
+  const nextState = buildStructuredAssistantCardState(event, record)
+  if (!nextState) return []
+
+  const structured = extractStructuredContentFromBlocks(parsed.blocks)
+  const fallbackText = buildContentFromBlocks(parsed.blocks).trim()
+  if (nextState.mode === 'text') {
+    return fallbackText
+      ? [{
+          conversationKey: record.conversationKey,
+          text: fallbackText,
+          runId: record.runId,
+          ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          mode: 'fallback',
+          state: nextState,
+        }]
+      : []
+  }
+
+  return [{
+    conversationKey: record.conversationKey,
+    card: buildAssistantStreamingCard({
+      answerText: structured.answerText,
+      thinkingText: structured.thinkingText,
+      toolCalls: structured.toolCalls.map((item) => `[Tool call] ${item.name}`),
+      toolResults: structured.toolResults.map((item) => item.output ? `[Tool result]\n${item.output}` : '[Tool result]'),
+      isFinal: false,
+    }),
+    runId: record.runId,
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+    mode: nextState.cardId ? 'stream' : 'create',
+    state: nextState,
+  }]
+}
+
+function buildAssistantFinalizeDelivery(record: RunRecord): LarkOutboundDelivery[] {
+  const state = getStreamingState(record.runId)
+  if (!state || state.phase !== 'streaming') return []
+
+  const finalized = setStreamingState({
+    ...state,
+    phase: 'completed',
+    finalizedAt: Date.now(),
+  })
+
+  if (finalized.mode === 'text') {
+    return finalized.accumulatedText
+      ? [{
+          conversationKey: record.conversationKey,
+          text: finalized.accumulatedText,
+          runId: record.runId,
+          ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          mode: 'finalize',
+          state: finalized,
+        }]
+      : []
+  }
+
+  return [{
+    conversationKey: record.conversationKey,
+    card: buildAssistantStreamingCard({
+      answerText: finalized.accumulatedText,
+      isFinal: true,
+    }),
+    runId: record.runId,
+    ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+    mode: 'finalize',
+    state: finalized,
+  }]
 }
 
 export function buildLarkDeliveries(event: SessionEvent, record: RunRecord): LarkOutboundDelivery[] {
   if (record.channel !== 'lark') return []
 
   switch (event.type) {
-    case 'session.sdk.message': {
-      const text = extractLarkAssistantText(event)
-      if (!text) return []
-      return [{
-        conversationKey: record.conversationKey,
-        text,
-        runId: record.runId,
-        ...(record.sessionId ? { sessionId: record.sessionId } : {}),
-      }]
-    }
+    case 'session.sdk.message':
+      return buildAssistantStreamingDelivery(event, record)
     case 'session.sdk.control.requested':
       if (event.interaction.kind === 'permission') {
         return [{
@@ -649,6 +1092,8 @@ export function buildLarkDeliveries(event: SessionEvent, record: RunRecord): Lar
           card: buildPermissionCard(record.runId, event.interaction),
           runId: record.runId,
           ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          mode: 'create',
+          state: buildPermissionCardKitState(record),
         }]
       }
       return [{
@@ -656,14 +1101,38 @@ export function buildLarkDeliveries(event: SessionEvent, record: RunRecord): Lar
         text: summarizeLarkInteraction(record.runId, event.interaction),
         runId: record.runId,
         ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+        mode: 'fallback',
       }]
-    case 'session.run.failed':
+    case 'session.sdk.control.resolved':
+      if (event.interaction.kind === 'permission') {
+        const decision = event.interaction.decisionReason === 'approve' || event.interaction.decisionReason === 'deny'
+          ? event.interaction.decisionReason
+          : 'approve'
+        return [{
+          conversationKey: record.conversationKey,
+          text: `Permission resolved: ${event.interaction.status}`,
+          card: buildPermissionResolvedCard(decision, event.interaction.status === 'resolved'),
+          runId: record.runId,
+          ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+          mode: 'create',
+          state: buildPermissionCardKitState(record),
+        }]
+      }
+      return []
+    case 'session.run.completed':
+    case 'session.run.cancelled':
+      return buildAssistantFinalizeDelivery(record)
+    case 'session.run.failed': {
+      const finalized = buildAssistantFinalizeDelivery(record)
+      if (finalized.length > 0) return finalized
       return [{
         conversationKey: record.conversationKey,
         text: `Run failed: ${event.error}`,
         runId: record.runId,
         ...(record.sessionId ? { sessionId: record.sessionId } : {}),
+        mode: 'fallback',
       }]
+    }
     default:
       return []
   }
@@ -690,8 +1159,112 @@ export async function deliverLarkSessionEvent(event: SessionEvent, record: RunRe
       payload: delivery.card ?? delivery.text,
     })
 
+    if (delivery.card && delivery.state && delivery.state.mode === 'cardkit') {
+      if (!delivery.state.cardId && delivery.mode === 'create') {
+        const result = await sendLarkCardKitMessage(delivery.conversationKey, {
+          schema: '2.0',
+          config: delivery.card && typeof delivery.card === 'object' && 'config' in (delivery.card as Record<string, unknown>)
+            ? ((delivery.card as Record<string, unknown>).config as Record<string, unknown>)
+            : { wide_screen_mode: true, streaming_mode: true },
+          header: delivery.card && typeof delivery.card === 'object' && 'header' in (delivery.card as Record<string, unknown>)
+            ? (delivery.card as Record<string, unknown>).header
+            : undefined,
+          body: {
+            elements: delivery.card && typeof delivery.card === 'object' && 'elements' in (delivery.card as Record<string, unknown>)
+              ? (delivery.card as Record<string, unknown>).elements
+              : [],
+          },
+        })
+        if (result.delivered) {
+          if (delivery.state) {
+            setStreamingState({
+              ...delivery.state,
+              cardId: result.cardId,
+              messageId: result.messageId,
+            })
+          }
+        } else if (delivery.state) {
+          setStreamingState({
+            ...delivery.state,
+            mode: 'text',
+          })
+        }
+        await appendLarkChannelLog({
+          sessionId: delivery.sessionId,
+          runId: delivery.runId,
+          direction: 'outbound',
+          eventName: result.delivered ? 'message.delivered' : 'message.failed',
+          conversationKey: delivery.conversationKey,
+          payloadSummary: result.delivered ? 'cardkit-card' : (result.error || 'failed'),
+          payload: result,
+        })
+        if (result.delivered) continue
+        if (delivery.text) {
+          const fallback = await sendLarkTextMessage(delivery.conversationKey, delivery.text)
+          await appendLarkChannelLog({
+            sessionId: delivery.sessionId,
+            runId: delivery.runId,
+            direction: 'outbound',
+            eventName: fallback.delivered ? 'message.delivered' : 'message.failed',
+            conversationKey: delivery.conversationKey,
+            payloadSummary: fallback.delivered ? delivery.text : (fallback.error || 'failed'),
+            payload: fallback,
+          })
+          continue
+        }
+      }
+
+      if (delivery.state.cardId && delivery.mode === 'stream') {
+        const result = await updateLarkCardKitStreamingContent(delivery.state, delivery.card as ReturnType<typeof buildAssistantStreamingCard>)
+        await appendLarkChannelLog({
+          sessionId: delivery.sessionId,
+          runId: delivery.runId,
+          direction: 'outbound',
+          eventName: result.delivered ? 'message.delivered' : 'message.failed',
+          conversationKey: delivery.conversationKey,
+          payloadSummary: result.delivered ? 'cardkit-stream' : (result.error || 'failed'),
+          payload: result,
+        })
+        if (result.delivered) continue
+      }
+
+      if (delivery.state.cardId && delivery.mode === 'finalize') {
+        const result = await finalizeLarkCardKit(delivery.state, delivery.card as ReturnType<typeof buildAssistantStreamingCard>)
+        await appendLarkChannelLog({
+          sessionId: delivery.sessionId,
+          runId: delivery.runId,
+          direction: 'outbound',
+          eventName: result.delivered ? 'message.delivered' : 'message.failed',
+          conversationKey: delivery.conversationKey,
+          payloadSummary: result.delivered ? 'cardkit-finalize' : (result.error || 'failed'),
+          payload: result,
+        })
+        clearStreamingState(delivery.runId || record.runId)
+        if (result.delivered) continue
+      }
+    }
+
     if (delivery.card) {
       const result = await sendLarkCardMessage(delivery.conversationKey, delivery.card)
+      if (delivery.state) {
+        const nextMode = result.delivered ? delivery.state.mode : 'text'
+        setStreamingState({
+          ...delivery.state,
+          mode: nextMode,
+        })
+      }
+      await appendLarkChannelLog({
+        sessionId: delivery.sessionId,
+        runId: delivery.runId,
+        direction: 'outbound',
+        eventName: 'card.raw.requested',
+        conversationKey: delivery.conversationKey,
+        payloadSummary: 'interactive-card-raw',
+        rawPayload: result.content,
+        payload: {
+          contentLength: result.content.length,
+        },
+      })
       await appendLarkChannelLog({
         sessionId: delivery.sessionId,
         runId: delivery.runId,
@@ -699,12 +1272,16 @@ export async function deliverLarkSessionEvent(event: SessionEvent, record: RunRe
         eventName: result.delivered ? 'message.delivered' : 'message.failed',
         conversationKey: delivery.conversationKey,
         payloadSummary: result.delivered ? 'interactive-card' : (result.error || 'failed'),
+        rawPayload: result.responseContent,
         payload: result,
       })
       continue
     }
     if (delivery.text) {
       const result = await sendLarkTextMessage(delivery.conversationKey, delivery.text)
+      if (delivery.mode === 'finalize') {
+        clearStreamingState(delivery.runId || record.runId)
+      }
       await appendLarkChannelLog({
         sessionId: delivery.sessionId,
         runId: delivery.runId,

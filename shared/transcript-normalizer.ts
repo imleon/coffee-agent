@@ -18,7 +18,12 @@ export interface TranscriptMessage {
   raw?: unknown
 }
 
-export type TranscriptRole = TranscriptMessage['role']
+export interface TranscriptStructuredContent {
+  answerText: string
+  thinkingText: string
+  toolCalls: Array<{ name: string; toolUseId?: string }>
+  toolResults: Array<{ toolUseId?: string; output: string }>
+}
 
 export function stringifyStructuredValue(value: unknown): string {
   if (typeof value === 'string') return value
@@ -139,22 +144,65 @@ export function normalizeContentBlocks(message: unknown): TranscriptBlock[] {
   return [{ type: 'unknown', raw: message }]
 }
 
-export function buildContentFromBlocks(blocks: TranscriptBlock[]): string {
-  return blocks
-    .map((block) => {
-      switch (block.type) {
-        case 'text':
-          return block.text || ''
-        case 'tool_use':
-          return `[Tool call] ${block.name || 'unknown_tool'}`
-        case 'tool_result': {
-          const output = stringifyStructuredValue(block.output)
-          return output ? `[Tool result]\n${output}` : '[Tool result]'
-        }
-        default:
-          return ''
+export function extractStructuredContentFromBlocks(blocks: TranscriptBlock[]): TranscriptStructuredContent {
+  const answerParts: string[] = []
+  const thinkingParts: string[] = []
+  const toolCalls: Array<{ name: string; toolUseId?: string }> = []
+  const toolResults: Array<{ toolUseId?: string; output: string }> = []
+
+  for (const block of blocks) {
+    switch (block.type) {
+      case 'text':
+        if (block.text) answerParts.push(block.text)
+        break
+      case 'thinking':
+        if (block.text) thinkingParts.push(block.text)
+        break
+      case 'tool_use':
+        toolCalls.push({
+          name: block.name || 'unknown_tool',
+          ...(block.toolUseId ? { toolUseId: block.toolUseId } : {}),
+        })
+        break
+      case 'tool_result': {
+        const output = stringifyStructuredValue(block.output)
+        toolResults.push({
+          ...(block.toolUseId ? { toolUseId: block.toolUseId } : {}),
+          output,
+        })
+        break
       }
-    })
+      default:
+        break
+    }
+  }
+
+  return {
+    answerText: answerParts.join('\n\n').trim(),
+    thinkingText: thinkingParts.join('\n\n').trim(),
+    toolCalls,
+    toolResults,
+  }
+}
+
+export function hasRenderableTranscriptContent(blocks: TranscriptBlock[]): boolean {
+  const structured = extractStructuredContentFromBlocks(blocks)
+  return Boolean(
+    structured.answerText
+      || structured.thinkingText
+      || structured.toolCalls.length > 0
+      || structured.toolResults.some((item) => item.output)
+  )
+}
+
+export function buildContentFromBlocks(blocks: TranscriptBlock[]): string {
+  const structured = extractStructuredContentFromBlocks(blocks)
+  return [
+    structured.thinkingText ? `Thinking:\n${structured.thinkingText}` : '',
+    structured.answerText,
+    ...structured.toolCalls.map((block) => `[Tool call] ${block.name}`),
+    ...structured.toolResults.map((block) => block.output ? `[Tool result]\n${block.output}` : '[Tool result]'),
+  ]
     .filter(Boolean)
     .join('\n\n')
     .trim()
@@ -182,10 +230,10 @@ export function extractTimestamp(message: unknown): number | undefined {
 }
 
 export function normalizeTranscriptMessage(
-  role: TranscriptRole,
+  role: TranscriptMessage['role'],
   message: unknown,
   raw?: unknown,
-  timestamp?: number
+  timestamp?: number,
 ): TranscriptMessage {
   const blocks = normalizeContentBlocks(message)
   return {
@@ -197,18 +245,97 @@ export function normalizeTranscriptMessage(
   }
 }
 
+export function normalizeStoredTranscriptBlocks(payload: unknown): TranscriptBlock[] | undefined {
+  if (!Array.isArray(payload)) return undefined
+
+  const blocks: TranscriptBlock[] = []
+
+  for (const item of payload) {
+    if (!item || typeof item !== 'object') continue
+
+    const record = item as Record<string, unknown>
+    const type = typeof record.type === 'string' ? record.type : 'unknown'
+    const raw = 'raw' in record ? record.raw : item
+
+    if (type === 'text') {
+      blocks.push({
+        type: 'text',
+        text: typeof record.text === 'string' ? record.text : stringifyStructuredValue(record.text),
+        raw,
+      })
+      continue
+    }
+
+    if (type === 'tool_use') {
+      blocks.push({
+        type: 'tool_use',
+        name: typeof record.name === 'string' ? record.name : 'unknown_tool',
+        toolUseId: typeof record.toolUseId === 'string'
+          ? record.toolUseId
+          : typeof record.tool_use_id === 'string'
+            ? record.tool_use_id
+            : undefined,
+        input: record.input,
+        raw,
+      })
+      continue
+    }
+
+    if (type === 'tool_result') {
+      blocks.push({
+        type: 'tool_result',
+        toolUseId: typeof record.toolUseId === 'string'
+          ? record.toolUseId
+          : typeof record.tool_use_id === 'string'
+            ? record.tool_use_id
+            : undefined,
+        output: record.output,
+        raw,
+      })
+      continue
+    }
+
+    if (type === 'thinking') {
+      blocks.push({
+        type: 'thinking',
+        text: typeof record.text === 'string' ? record.text : undefined,
+        raw,
+      })
+      continue
+    }
+
+    blocks.push({
+      type: 'unknown',
+      raw,
+    })
+  }
+
+  return blocks
+}
+
 export function normalizeStoredTranscriptMessage(payload: unknown): TranscriptMessage {
   const record = payload && typeof payload === 'object' ? payload as Record<string, unknown> : {}
   const role = record.role === 'user' || record.role === 'assistant' || record.role === 'system'
     ? record.role
     : 'assistant'
-  const message = 'raw' in record && record.raw !== undefined ? record.raw : payload
+  const raw = 'raw' in record && record.raw !== undefined ? record.raw : payload
   const explicitContent = typeof record.content === 'string' ? record.content : undefined
-  const normalized = normalizeTranscriptMessage(role, message, message, typeof record.timestamp === 'number' ? record.timestamp : undefined)
+  const blocks = normalizeStoredTranscriptBlocks(record.blocks)
+  const timestamp = typeof record.timestamp === 'number'
+    ? record.timestamp
+    : extractTimestamp(raw)
 
-  return explicitContent && !normalized.content
-    ? { ...normalized, content: explicitContent }
-    : normalized
+  if (explicitContent !== undefined || blocks !== undefined || ('raw' in record && record.raw !== undefined)) {
+    return {
+      role,
+      content: explicitContent ?? buildContentFromBlocks(blocks ?? []),
+      ...(timestamp !== undefined ? { timestamp } : {}),
+      ...(blocks !== undefined ? { blocks } : {}),
+      raw,
+    }
+  }
+
+  return normalizeTranscriptMessage(role, payload, raw, timestamp)
 }
 
 export function normalizeSdkEnvelopeMessage(payload: unknown): TranscriptMessage | null {

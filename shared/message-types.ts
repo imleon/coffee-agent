@@ -37,10 +37,28 @@ export interface ChannelOutboundMessage extends ChannelConversationRef {
 
 export interface SessionBinding extends ChannelConversationRef {
   sessionId: string
+  updatedAt: number
   lastRunId?: string
   activeInteractionId?: string
   lastInboundPlatformMessageId?: string
-  updatedAt: number
+}
+
+export type LarkDeliveryMode = 'cardkit' | 'interactive' | 'text'
+
+export type LarkStreamingPhase = 'idle' | 'streaming' | 'completed' | 'failed'
+
+export interface LarkStreamingState {
+  runId: string
+  conversationKey: string
+  sessionId?: string
+  mode: LarkDeliveryMode
+  phase: LarkStreamingPhase
+  accumulatedText: string
+  sequence: number
+  messageId?: string
+  cardId?: string
+  lastMessageCursor?: number
+  finalizedAt?: number
 }
 
 export interface PendingInteractionBase {
@@ -123,6 +141,17 @@ export interface SessionTransportLogPage {
   nextCursor: number | null
 }
 
+export interface SessionPersistentLogEntry {
+  cursor: number
+  line: string
+}
+
+export interface SessionPersistentLogPage {
+  items: SessionPersistentLogEntry[]
+  hasMore: boolean
+  nextCursor: number | null
+}
+
 export interface SessionRuntimeLogEntry {
   cursor: number
   runId: string
@@ -146,6 +175,7 @@ export interface ChannelLogEvent {
   platformMessageId?: string
   payloadSummary?: string
   payload?: unknown
+  rawPayload?: unknown
 }
 
 export interface SessionChannelLogEntry {
