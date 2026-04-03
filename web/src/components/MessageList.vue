@@ -156,9 +156,18 @@ function renderMarkdown(content: string): string {
   })
 }
 
+function renderToolResultOutput(output: unknown): string {
+  return stringifyStructuredValue(output)
+}
+
 function hasBlocks(blocks?: SessionMessageBlock[]): boolean {
   return Array.isArray(blocks) && blocks.length > 0
 }
+
+function hasRenderableBlocks(message: SessionMessage | null | undefined): boolean {
+  return hasBlocks(message?.blocks)
+}
+
 
 function normalizeLegacyMessage(payload: unknown): SessionMessage | null {
   return normalizeSdkEnvelopeMessage(payload) as SessionMessage | null
@@ -255,8 +264,19 @@ function formatDuration(durationMs: number | null | undefined): string {
   return `${seconds}s`
 }
 
-function getHistoryThreadFooter(item: TimelineItem): string {
-  const lastMessage = getHistoryThreadLastMessage(item)
+function getHistoryCardClass(item: TimelineItem): string {
+  if (item.kind === 'history-message' || item.kind === 'history-assistant-thread') {
+    return 'bg-white border border-gray-200 shadow-sm'
+  }
+  return getMessageClass(getTimelineMessage(item))
+}
+
+function getHistoryCardFooter(item: TimelineItem): string {
+  const lastMessage = item.kind === 'history-assistant-thread'
+    ? getHistoryThreadLastMessage(item)
+    : item.kind === 'history-message'
+      ? item.message
+      : null
   if (!lastMessage) return ''
 
   const inputTokens = getAssistantUsageValue(lastMessage, 'input_tokens')
@@ -265,7 +285,9 @@ function getHistoryThreadFooter(item: TimelineItem): string {
   const cacheWriteTokens = getAssistantUsageValue(lastMessage, 'cache_creation_input_tokens')
   const model = getAssistantModelName(lastMessage)
   const stopReason = getAssistantStopReason(lastMessage)
-  const executionDuration = item.kind === 'history-assistant-thread' ? formatDuration(item.executionDurationMs) : '-'
+  const executionDuration = item.kind === 'history-message' || item.kind === 'history-assistant-thread'
+    ? formatDuration(item.executionDurationMs)
+    : '-'
 
   return `${stopReason} • ${executionDuration} • ↑ ${formatCompactNumber(inputTokens)} ↓ ${formatCompactNumber(outputTokens)} • R ${formatCompactNumber(cacheReadTokens)} W ${formatCompactNumber(cacheWriteTokens)} • ${model}`
 }
@@ -287,9 +309,8 @@ function getMessageClass(message: SessionMessage | null | undefined): string {
 }
 
 function isUserTimelineItem(item: TimelineItem): boolean {
-  if (item.kind === 'history-assistant-thread') return false
   if (item.kind === 'history-user-message') return true
-  if (item.kind === 'history-message') return item.message.role === 'user'
+  if (item.kind === 'history-message' || item.kind === 'history-assistant-thread') return false
   return item.event.payload?.type === 'user'
 }
 
@@ -421,7 +442,7 @@ watch(
           <div v-if="isRedactedThinkingMessage(threadItem.message)" class="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-600">
             redacted_thinking
           </div>
-          <template v-else-if="getMessageRole(threadItem.message) === 'assistant' && hasBlocks(threadItem.message.blocks)">
+          <template v-else-if="hasRenderableBlocks(threadItem.message)">
             <div
               v-for="(block, blockIndex) in threadItem.message.blocks || []"
               :key="`${threadItem.key}-${blockIndex}`"
@@ -447,17 +468,22 @@ watch(
                 class="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700"
               >
                 <div class="font-medium">Tool result</div>
-                <pre
+                <div
                   v-if="block.output"
-                  class="mt-2 whitespace-pre-wrap text-xs text-gray-800"
-                >{{ stringifyStructuredValue(block.output) }}</pre>
+                  class="markdown-body prose prose-sm mt-2 max-w-none text-gray-800"
+                  v-html="renderMarkdown(renderToolResultOutput(block.output))"
+                />
               </div>
               <div
                 v-else-if="block.type === 'thinking'"
                 class="rounded-lg border border-purple-200 bg-purple-50 px-3 py-2 text-sm text-purple-800"
               >
                 <div class="font-medium">Thinking</div>
-                <pre class="mt-2 whitespace-pre-wrap text-xs text-purple-900">{{ block.text }}</pre>
+                <div
+                  v-if="block.text"
+                  class="markdown-body prose prose-sm mt-2 max-w-none text-purple-900"
+                  v-html="renderMarkdown(block.text)"
+                />
               </div>
               <div
                 v-else
@@ -476,13 +502,13 @@ watch(
           <div v-else class="whitespace-pre-wrap">{{ renderMessageContent(threadItem.message) }}</div>
         </div>
         <div class="mt-3 border-t border-gray-100 pt-3 text-xs text-gray-500">
-          {{ getHistoryThreadFooter(item) }}
+          {{ getHistoryCardFooter(item) }}
         </div>
       </div>
       <div
         v-else
         class="max-w-[75%] rounded-2xl px-4 py-3"
-        :class="getMessageClass(getTimelineMessage(item))"
+        :class="getHistoryCardClass(item)"
       >
         <div class="mb-2 text-[11px] uppercase tracking-wide opacity-60">
           {{ getPayloadType(item) }}
@@ -497,7 +523,7 @@ watch(
             redacted_thinking
           </div>
         </template>
-        <template v-else-if="getMessageRole(getTimelineMessage(item)) === 'assistant' && hasBlocks(getTimelineMessage(item)?.blocks)">
+        <template v-else-if="hasRenderableBlocks(getTimelineMessage(item))">
           <div
             v-for="(block, blockIndex) in getTimelineMessage(item)?.blocks || []"
             :key="`${item.key}-${blockIndex}`"
@@ -523,10 +549,11 @@ watch(
               class="rounded-lg border border-gray-200 bg-gray-50 px-3 py-2 text-sm text-gray-700"
             >
               <div class="font-medium">Tool result</div>
-              <pre
+              <div
                 v-if="block.output"
-                class="mt-2 whitespace-pre-wrap text-xs text-gray-800"
-              >{{ stringifyStructuredValue(block.output) }}</pre>
+                class="markdown-body prose prose-sm mt-2 max-w-none text-gray-800"
+                v-html="renderMarkdown(renderToolResultOutput(block.output))"
+              />
             </div>
             <div
               v-else-if="block.type === 'thinking'"
@@ -550,6 +577,9 @@ watch(
           v-html="renderMarkdown(renderMessageContent(getTimelineMessage(item) as SessionMessage))"
         />
         <div v-else-if="getTimelineMessage(item)" class="whitespace-pre-wrap">{{ renderMessageContent(getTimelineMessage(item) as SessionMessage) }}</div>
+        <div v-if="item.kind === 'history-message'" class="mt-3 border-t border-gray-100 pt-3 text-xs text-gray-500">
+          {{ getHistoryCardFooter(item) }}
+        </div>
       </div>
     </div>
 

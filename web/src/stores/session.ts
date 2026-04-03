@@ -57,6 +57,7 @@ export interface HistorySingleMessageTimelineItem {
   key: string
   message: HistoryMessage
   timestamp: number
+  executionDurationMs: number | null
 }
 
 export interface HistoryAssistantThreadItem {
@@ -116,139 +117,130 @@ function getHistoryMessageTimestamp(message: HistoryMessage, fallback: number): 
   return typeof message.timestamp === 'number' ? message.timestamp : fallback
 }
 
-function isAssistantHistoryMessage(message: HistoryMessage): boolean {
-  return message.role === 'assistant'
-}
-
 function getHistoryMessageKey(message: HistoryMessage, index: number): string {
   return getHistoryMessageUuid(message) ?? `history-${index}`
 }
 
-function isAssistantThreadRoot(message: HistoryMessage, messagesByUuid: Map<string, HistoryMessage>): boolean {
-  if (!isAssistantHistoryMessage(message)) return false
-  const parentUuid = getHistoryMessageParentUuid(message)
-  if (!parentUuid) return true
-  const parent = messagesByUuid.get(parentUuid)
-  return !parent || parent.role !== 'assistant'
+function getHistoryRawMessage(message: HistoryMessage): Record<string, unknown> | null {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object') return null
+  const rawMessage = (raw as Record<string, unknown>).message
+  return rawMessage && typeof rawMessage === 'object' ? rawMessage as Record<string, unknown> : null
 }
 
-function getAssistantThreadExecutionDuration(
-  rootMessage: HistoryMessage,
-  lastTimestamp: number,
-  messagesByUuid: Map<string, HistoryMessage>,
-  fallbackIndex: number,
-): number | null {
-  const parentUuid = getHistoryMessageParentUuid(rootMessage)
-  if (!parentUuid) return null
+function hasHistoryRawContentType(message: HistoryMessage, expectedType: string): boolean {
+  const rawMessage = getHistoryRawMessage(message)
+  if (!rawMessage) return false
+  const content = rawMessage.content
 
-  const parentMessage = messagesByUuid.get(parentUuid)
-  if (!parentMessage || parentMessage.role !== 'user') return null
+  if (Array.isArray(content)) {
+    return content.some((item) => Boolean(item) && typeof item === 'object' && (item as Record<string, unknown>).type === expectedType)
+  }
 
-  const parentTimestamp = getHistoryMessageTimestamp(parentMessage, fallbackIndex)
-  const duration = lastTimestamp - parentTimestamp
+  return Boolean(content && typeof content === 'object' && (content as Record<string, unknown>).type === expectedType)
+}
+
+function getHistoryMessageSemanticType(message: HistoryMessage): string {
+  if (message.blocks?.some((block) => block.type === 'tool_result')) return 'tool_result'
+  if (hasHistoryRawContentType(message, 'tool_result')) return 'tool_result'
+  if (hasHistoryRawContentType(message, 'user')) return 'user'
+  return message.role
+}
+
+function isToolResultHistoryMessage(message: HistoryMessage): boolean {
+  return getHistoryMessageSemanticType(message) === 'tool_result'
+}
+
+function getHistoryMessageStopReason(message: HistoryMessage): string | null {
+  const rawMessage = getHistoryRawMessage(message)
+  if (!rawMessage) return null
+  const stopReason = rawMessage.stop_reason
+  return typeof stopReason === 'string' && stopReason ? stopReason : null
+}
+
+function isRightSideHistoryMessage(message: HistoryMessage): boolean {
+  return message.role === 'user' && getHistoryMessageSemanticType(message) === 'user'
+}
+
+function getDurationSincePreviousCard(currentTimestamp: number, previousCardTimestamp: number | null): number | null {
+  if (typeof previousCardTimestamp !== 'number' || !Number.isFinite(previousCardTimestamp)) return null
+  const duration = currentTimestamp - previousCardTimestamp
   return duration >= 0 ? duration : null
 }
 
 function buildHistoryTimeline(messages: HistoryMessage[]): HistoryTimelineItem[] {
-  const messagesByUuid = new Map<string, HistoryMessage>()
-  const messageIndexByUuid = new Map<string, number>()
-  const childrenByParent = new Map<string, HistoryMessage[]>()
-
-  for (const [index, message] of messages.entries()) {
-    const uuid = getHistoryMessageUuid(message)
-    if (!uuid) continue
-    messagesByUuid.set(uuid, message)
-    messageIndexByUuid.set(uuid, index)
-  }
-
-  for (const message of messages) {
-    const parentUuid = getHistoryMessageParentUuid(message)
-    if (!parentUuid) continue
-    const parent = messagesByUuid.get(parentUuid)
-    if (!parent) continue
-    const siblings = childrenByParent.get(parentUuid) ?? []
-    siblings.push(message)
-    childrenByParent.set(parentUuid, siblings)
-  }
-
-  const assistantItemsByRootUuid = new Map<string, HistoryAssistantThreadItem[]>()
-  const assistantCoveredUuids = new Set<string>()
-
-  const appendAssistantThreadItems = (message: HistoryMessage, depth: number, bucket: HistoryAssistantThreadItem[]) => {
-    const uuid = getHistoryMessageUuid(message)
-    const fallbackIndex = typeof uuid === 'string' ? (messageIndexByUuid.get(uuid) ?? bucket.length) : bucket.length
-    if (isAssistantHistoryMessage(message)) {
-      if (uuid) assistantCoveredUuids.add(uuid)
-      bucket.push({
-        key: `${getHistoryMessageKey(message, fallbackIndex)}-${depth}`,
-        message,
-        depth,
-        timestamp: getHistoryMessageTimestamp(message, fallbackIndex),
-      })
-    }
-
-    if (!uuid) return
-    const children = childrenByParent.get(uuid) ?? []
-    for (const child of children) {
-      if (!isAssistantHistoryMessage(child)) continue
-      appendAssistantThreadItems(child, depth + 1, bucket)
-    }
-  }
-
-  for (const message of messages) {
-    if (!isAssistantThreadRoot(message, messagesByUuid)) continue
-    const rootUuid = getHistoryMessageUuid(message)
-    const fallbackIndex = typeof rootUuid === 'string' ? (messageIndexByUuid.get(rootUuid) ?? 0) : 0
-    const items: HistoryAssistantThreadItem[] = []
-    appendAssistantThreadItems(message, 0, items)
-    if (!items.length) continue
-    assistantItemsByRootUuid.set(getHistoryMessageKey(message, fallbackIndex), items)
-  }
-
   const timeline: HistoryTimelineItem[] = []
+  const leftBucket: Array<{ key: string; message: HistoryMessage; timestamp: number }> = []
+  let previousCardTimestamp: number | null = null
+
+  const flushLeftBucket = () => {
+    if (!leftBucket.length) return
+
+    if (leftBucket.length === 1) {
+      const item = leftBucket[0]
+      timeline.push({
+        kind: 'history-message',
+        key: `history-${item.key}`,
+        message: item.message,
+        timestamp: item.timestamp,
+        executionDurationMs: getDurationSincePreviousCard(item.timestamp, previousCardTimestamp),
+      })
+      previousCardTimestamp = item.timestamp
+      leftBucket.length = 0
+      return
+    }
+
+    const rootItem = leftBucket[0]
+    const lastItem = leftBucket[leftBucket.length - 1]
+    timeline.push({
+      kind: 'history-assistant-thread',
+      key: `history-assistant-thread-${rootItem.key}`,
+      rootMessage: rootItem.message,
+      items: leftBucket.map((item, depth) => ({
+        key: `${item.key}-${depth}`,
+        message: item.message,
+        depth,
+        timestamp: item.timestamp,
+      })),
+      timestamp: lastItem.timestamp,
+      executionDurationMs: getDurationSincePreviousCard(lastItem.timestamp, previousCardTimestamp),
+    })
+    previousCardTimestamp = lastItem.timestamp
+    leftBucket.length = 0
+  }
 
   for (const [index, message] of messages.entries()) {
     const timestamp = getHistoryMessageTimestamp(message, index)
     const key = getHistoryMessageKey(message, index)
 
-    if (message.role === 'user') {
+    if (isRightSideHistoryMessage(message)) {
+      flushLeftBucket()
       timeline.push({
         kind: 'history-user-message',
         key: `history-user-${key}`,
         message,
         timestamp,
       })
+      previousCardTimestamp = timestamp
       continue
     }
 
-    if (isAssistantThreadRoot(message, messagesByUuid)) {
-      const items = assistantItemsByRootUuid.get(key) ?? []
-      if (!items.length) continue
-      const lastTimestamp = items[items.length - 1]?.timestamp ?? timestamp
-      timeline.push({
-        kind: 'history-assistant-thread',
-        key: `history-assistant-thread-${key}`,
-        rootMessage: message,
-        items,
-        timestamp: lastTimestamp,
-        executionDurationMs: getAssistantThreadExecutionDuration(message, lastTimestamp, messagesByUuid, index),
-      })
-      continue
+    if (leftBucket.length > 0 && !getHistoryMessageParentUuid(message)) {
+      flushLeftBucket()
     }
 
-    if (isAssistantHistoryMessage(message)) {
-      const uuid = getHistoryMessageUuid(message)
-      if (uuid && assistantCoveredUuids.has(uuid)) continue
-    }
-
-    timeline.push({
-      kind: 'history-message',
-      key: `history-${key}`,
+    leftBucket.push({
+      key,
       message,
       timestamp,
     })
+
+    if (getHistoryMessageStopReason(message)) {
+      flushLeftBucket()
+    }
   }
 
+  flushLeftBucket()
   return timeline
 }
 
