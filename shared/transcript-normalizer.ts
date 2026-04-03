@@ -25,6 +25,46 @@ export interface TranscriptStructuredContent {
   toolResults: Array<{ toolUseId?: string; output: string }>
 }
 
+export type TranscriptLivePreviewPhase = 'idle' | 'thinking' | 'responding' | 'tool-input' | 'complete'
+
+export interface TranscriptLivePreviewTextBlock {
+  kind: 'text'
+  index: number
+  text: string
+}
+
+export interface TranscriptLivePreviewThinkingBlock {
+  kind: 'thinking'
+  index: number
+  text: string
+  redacted?: boolean
+}
+
+export interface TranscriptLivePreviewToolUseBlock {
+  kind: 'tool_use'
+  index: number
+  name: string
+  toolUseId?: string
+  inputText: string
+}
+
+export type TranscriptLivePreviewBlock =
+  | TranscriptLivePreviewTextBlock
+  | TranscriptLivePreviewThinkingBlock
+  | TranscriptLivePreviewToolUseBlock
+
+export interface TranscriptLivePreviewState {
+  phase: TranscriptLivePreviewPhase
+  active: boolean
+  scopeKey?: string
+  receivedAt?: number
+  sequence?: number
+  sessionId?: string
+  parentToolUseId?: string | null
+  messageId?: string
+  blocks: TranscriptLivePreviewBlock[]
+}
+
 export function stringifyStructuredValue(value: unknown): string {
   if (typeof value === 'string') return value
   if (typeof value === 'number' || typeof value === 'boolean') return String(value)
@@ -63,6 +103,11 @@ export function normalizeContentBlocks(message: unknown): TranscriptBlock[] {
   }
 
   const record = message as Record<string, unknown>
+
+  if (record.message && typeof record.message === 'object') {
+    const nestedBlocks = normalizeContentBlocks(record.message)
+    if (nestedBlocks.length > 0) return nestedBlocks
+  }
 
   if (typeof record.content === 'string') {
     return [{ type: 'text', text: record.content, raw: message }]
@@ -352,6 +397,384 @@ export function normalizeAssistantMessage(message: SDKAssistantMessage): Transcr
   return normalizeTranscriptMessage('assistant', message.message, message)
 }
 
-export function normalizeUserMessage(message: SDKUserMessage): TranscriptMessage {
-  return normalizeTranscriptMessage('user', message.message, message)
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : null
+}
+
+function getStreamEvent(payload: unknown): Record<string, unknown> | null {
+  const record = asRecord(payload)
+  const event = record?.event
+  return asRecord(event)
+}
+
+function getStreamEventIndex(payload: unknown): number | null {
+  const event = getStreamEvent(payload)
+  return typeof event?.index === 'number' ? event.index : null
+}
+
+function getLivePreviewScopeKey(payload: unknown): string {
+  const record = asRecord(payload)
+  const sessionId = typeof record?.sessionId === 'string'
+    ? record.sessionId
+    : typeof record?.session_id === 'string'
+      ? record.session_id
+      : 'unknown-session'
+  const parentToolUseId = typeof record?.parent_tool_use_id === 'string'
+    ? record.parent_tool_use_id
+    : record?.parent_tool_use_id === null
+      ? 'root'
+      : 'root'
+  return `${sessionId}:${parentToolUseId}`
+}
+
+function getScopeMessageId(payload: unknown): string | undefined {
+  const event = getStreamEvent(payload)
+  const message = asRecord(event?.message)
+  return typeof message?.id === 'string' ? message.id : undefined
+}
+
+function upsertLivePreviewBlock(
+  blocks: TranscriptLivePreviewBlock[],
+  nextBlock: TranscriptLivePreviewBlock,
+): TranscriptLivePreviewBlock[] {
+  const index = blocks.findIndex((block) => block.index === nextBlock.index && block.kind === nextBlock.kind)
+  if (index === -1) return [...blocks, nextBlock].sort((left, right) => left.index - right.index)
+  return blocks.map((block, blockIndex) => (blockIndex === index ? nextBlock : block))
+}
+
+function getToolUseIdFromBlock(block: Record<string, unknown> | null): string | undefined {
+  if (!block) return undefined
+  if (typeof block.id === 'string' && block.id) return block.id
+  if (typeof block.tool_use_id === 'string' && block.tool_use_id) return block.tool_use_id
+  if (typeof block.toolUseId === 'string' && block.toolUseId) return block.toolUseId
+  return undefined
+}
+
+function getToolUseNameFromBlock(block: Record<string, unknown> | null): string {
+  if (!block) return 'unknown_tool'
+  return typeof block.name === 'string' && block.name ? block.name : 'unknown_tool'
+}
+
+export function createTranscriptLivePreviewState(): TranscriptLivePreviewState {
+  return {
+    phase: 'idle',
+    active: false,
+    blocks: [],
+  }
+}
+
+export function normalizeStreamEventSnapshot(payload: unknown): TranscriptLivePreviewState | null {
+  const record = asRecord(payload)
+  if (!record || record.type !== 'stream_event') return null
+
+  const event = getStreamEvent(record)
+  if (!event || typeof event.type !== 'string') return null
+
+  const base: TranscriptLivePreviewState = {
+    phase: 'idle',
+    active: true,
+    scopeKey: getLivePreviewScopeKey(record),
+    ...(typeof record.receivedAt === 'number' ? { receivedAt: record.receivedAt } : {}),
+    ...(typeof record.sequence === 'number' ? { sequence: record.sequence } : {}),
+    ...(typeof record.sessionId === 'string' ? { sessionId: record.sessionId } : {}),
+    ...(typeof record.parent_tool_use_id === 'string' || record.parent_tool_use_id === null ? { parentToolUseId: record.parent_tool_use_id as string | null } : {}),
+    blocks: [],
+  }
+
+  if (event.type === 'message_start') {
+    const message = asRecord(event.message)
+    return {
+      ...base,
+      phase: 'responding',
+      ...(typeof message?.id === 'string' ? { messageId: message.id } : {}),
+    }
+  }
+
+  if (event.type === 'message_stop') {
+    return {
+      ...base,
+      phase: 'complete',
+      active: false,
+    }
+  }
+
+  if (event.type === 'message_delta') {
+    return {
+      ...base,
+      phase: 'responding',
+    }
+  }
+
+  if (event.type === 'content_block_stop') {
+    return base
+  }
+
+  if (event.type === 'content_block_start') {
+    const block = asRecord(event.content_block)
+    const index = getStreamEventIndex(record)
+    if (index == null || !block || typeof block.type !== 'string') return base
+
+    if (block.type === 'text') {
+      return {
+        ...base,
+        phase: 'responding',
+        blocks: [{ kind: 'text', index, text: typeof block.text === 'string' ? block.text : '' }],
+      }
+    }
+
+    if (block.type === 'thinking') {
+      return {
+        ...base,
+        phase: 'thinking',
+        blocks: [{ kind: 'thinking', index, text: typeof block.thinking === 'string' ? block.thinking : '', redacted: false }],
+      }
+    }
+
+    if (block.type === 'redacted_thinking') {
+      return {
+        ...base,
+        phase: 'thinking',
+        blocks: [{ kind: 'thinking', index, text: '', redacted: true }],
+      }
+    }
+
+    if (block.type === 'tool_use') {
+      return {
+        ...base,
+        phase: 'tool-input',
+        blocks: [{
+          kind: 'tool_use',
+          index,
+          name: getToolUseNameFromBlock(block),
+          toolUseId: getToolUseIdFromBlock(block),
+          inputText: typeof block.input === 'string' ? block.input : stringifyStructuredValue(block.input),
+        }],
+      }
+    }
+
+    return base
+  }
+
+  if (event.type === 'content_block_delta') {
+    const delta = asRecord(event.delta)
+    const index = getStreamEventIndex(record)
+    if (index == null || !delta || typeof delta.type !== 'string') return base
+
+    if (delta.type === 'text_delta') {
+      return {
+        ...base,
+        phase: 'responding',
+        blocks: [{ kind: 'text', index, text: typeof delta.text === 'string' ? delta.text : '' }],
+      }
+    }
+
+    if (delta.type === 'thinking_delta') {
+      return {
+        ...base,
+        phase: 'thinking',
+        blocks: [{ kind: 'thinking', index, text: typeof delta.thinking === 'string' ? delta.thinking : '', redacted: false }],
+      }
+    }
+
+    if (delta.type === 'input_json_delta') {
+      return {
+        ...base,
+        phase: 'tool-input',
+        blocks: [{ kind: 'tool_use', index, name: 'unknown_tool', inputText: typeof delta.partial_json === 'string' ? delta.partial_json : '' }],
+      }
+    }
+  }
+
+  return base
+}
+
+export function reduceTranscriptLivePreviewState(
+  current: TranscriptLivePreviewState,
+  payload: unknown,
+): TranscriptLivePreviewState {
+  const snapshot = normalizeStreamEventSnapshot(payload)
+  if (!snapshot) return current
+
+  const currentScopeKey = current.scopeKey
+  const snapshotScopeKey = snapshot.scopeKey
+  const shouldResetForScope = Boolean(
+    current.active
+      && currentScopeKey
+      && snapshotScopeKey
+      && currentScopeKey !== snapshotScopeKey
+      && snapshot.phase === 'responding'
+      && snapshot.blocks.length === 0
+  )
+
+  const currentState = shouldResetForScope ? createTranscriptLivePreviewState() : current
+  const next: TranscriptLivePreviewState = {
+    ...currentState,
+    phase: snapshot.phase === 'idle' ? currentState.phase : snapshot.phase,
+    active: snapshot.active,
+    blocks: currentState.blocks,
+    ...(snapshot.scopeKey !== undefined ? { scopeKey: snapshot.scopeKey } : {}),
+    ...(snapshot.receivedAt !== undefined ? { receivedAt: snapshot.receivedAt } : {}),
+    ...(snapshot.sequence !== undefined ? { sequence: snapshot.sequence } : {}),
+    ...(snapshot.sessionId !== undefined ? { sessionId: snapshot.sessionId } : {}),
+    ...(snapshot.parentToolUseId !== undefined ? { parentToolUseId: snapshot.parentToolUseId } : {}),
+    ...(snapshot.messageId !== undefined ? { messageId: snapshot.messageId } : {}),
+  }
+
+  if (snapshot.phase === 'complete') {
+    return {
+      ...createTranscriptLivePreviewState(),
+      ...(snapshot.scopeKey !== undefined ? { scopeKey: snapshot.scopeKey } : {}),
+      ...(snapshot.receivedAt !== undefined ? { receivedAt: snapshot.receivedAt } : {}),
+      ...(snapshot.sequence !== undefined ? { sequence: snapshot.sequence } : {}),
+      ...(snapshot.sessionId !== undefined ? { sessionId: snapshot.sessionId } : {}),
+    }
+  }
+
+  let blocks = next.blocks
+  for (const block of snapshot.blocks) {
+    if (block.kind === 'tool_use' && block.name === 'unknown_tool') {
+      const existing = blocks.find((item) => item.kind === 'tool_use' && item.index === block.index)
+      if (existing && existing.kind === 'tool_use') {
+        blocks = upsertLivePreviewBlock(blocks, {
+          ...existing,
+          inputText: block.inputText,
+        })
+        continue
+      }
+    }
+    blocks = upsertLivePreviewBlock(blocks, block)
+  }
+
+  return {
+    ...next,
+    blocks,
+  }
+}
+
+export function clearTranscriptLivePreviewState(): TranscriptLivePreviewState {
+  return createTranscriptLivePreviewState()
+}
+
+
+export type TranscriptSemanticKind = 'user' | 'assistant' | 'tool_result' | 'thinking' | 'meta' | 'summary' | 'unknown'
+
+export interface TranscriptAssistantUsage {
+  inputTokens?: number | null
+  outputTokens?: number | null
+  cacheReadTokens?: number | null
+  cacheWriteTokens?: number | null
+}
+
+export function getTranscriptRawRecord(message: TranscriptMessage | null | undefined): Record<string, unknown> | null {
+  const raw = message?.raw
+  return raw && typeof raw === 'object' ? raw as Record<string, unknown> : null
+}
+
+export function getTranscriptRawMessage(message: TranscriptMessage | null | undefined): Record<string, unknown> | null {
+  const raw = getTranscriptRawRecord(message)
+  if (!raw) return null
+  const rawMessage = raw.message
+  return rawMessage && typeof rawMessage === 'object' ? rawMessage as Record<string, unknown> : null
+}
+
+export function getTranscriptMessageId(message: TranscriptMessage | null | undefined): string | null {
+  const raw = getTranscriptRawRecord(message)
+  if (!raw) return null
+  return typeof raw.uuid === 'string' && raw.uuid ? raw.uuid : null
+}
+
+export function getTranscriptParentMessageId(message: TranscriptMessage | null | undefined): string | null {
+  const raw = getTranscriptRawRecord(message)
+  if (!raw) return null
+  if (typeof raw.parentUuid === 'string' && raw.parentUuid) return raw.parentUuid
+  return raw.parentUuid === null ? null : null
+}
+
+export function getTranscriptStopReason(message: TranscriptMessage | null | undefined): string | null {
+  const rawMessage = getTranscriptRawMessage(message)
+  if (!rawMessage) return null
+  return typeof rawMessage.stop_reason === 'string' && rawMessage.stop_reason ? rawMessage.stop_reason : null
+}
+
+export function isTranscriptMetaMessage(message: TranscriptMessage | null | undefined): boolean {
+  const raw = getTranscriptRawRecord(message)
+  return raw?.isMeta === true
+}
+
+export function isTranscriptSummaryMessage(message: TranscriptMessage | null | undefined): boolean {
+  const raw = getTranscriptRawRecord(message)
+  return raw?.isCompactSummary === true
+}
+
+export function isTranscriptRedactedThinkingMessage(message: TranscriptMessage | null | undefined): boolean {
+  const rawMessage = getTranscriptRawMessage(message)
+  if (!rawMessage) return false
+  const content = rawMessage.content
+  if (Array.isArray(content)) {
+    return content.length === 1
+      && Boolean(content[0])
+      && typeof content[0] === 'object'
+      && (content[0] as Record<string, unknown>).type === 'redacted_thinking'
+  }
+
+  return Boolean(content && typeof content === 'object' && (content as Record<string, unknown>).type === 'redacted_thinking')
+}
+
+export function getTranscriptToolUseIds(message: TranscriptMessage | null | undefined): string[] {
+  if (!message?.blocks?.length) return []
+  return message.blocks
+    .flatMap((block) => block.type === 'tool_use' && typeof block.toolUseId === 'string' ? [block.toolUseId] : [])
+}
+
+export function getTranscriptToolResultIds(message: TranscriptMessage | null | undefined): string[] {
+  if (!message?.blocks?.length) return []
+  return message.blocks
+    .flatMap((block) => block.type === 'tool_result' && typeof block.toolUseId === 'string' ? [block.toolUseId] : [])
+}
+
+export function getTranscriptAssistantModel(message: TranscriptMessage | null | undefined): string | null {
+  const rawMessage = getTranscriptRawMessage(message)
+  if (!rawMessage) return null
+  return typeof rawMessage.model === 'string' && rawMessage.model ? rawMessage.model : null
+}
+
+export function getTranscriptAssistantUsage(message: TranscriptMessage | null | undefined): TranscriptAssistantUsage | null {
+  const rawMessage = getTranscriptRawMessage(message)
+  if (!rawMessage) return null
+  const usage = rawMessage.usage
+  if (!usage || typeof usage !== 'object') return null
+  const record = usage as Record<string, unknown>
+  return {
+    inputTokens: typeof record.input_tokens === 'number' ? record.input_tokens : null,
+    outputTokens: typeof record.output_tokens === 'number' ? record.output_tokens : null,
+    cacheReadTokens: typeof record.cache_read_input_tokens === 'number' ? record.cache_read_input_tokens : null,
+    cacheWriteTokens: typeof record.cache_creation_input_tokens === 'number' ? record.cache_creation_input_tokens : null,
+  }
+}
+
+export function getTranscriptSemanticKind(message: TranscriptMessage | null | undefined): TranscriptSemanticKind {
+  if (!message) return 'unknown'
+  if (isTranscriptSummaryMessage(message)) return 'summary'
+  if (isTranscriptMetaMessage(message)) return 'meta'
+  if (isTranscriptRedactedThinkingMessage(message)) return 'thinking'
+  if (message.blocks?.some((block) => block.type === 'thinking')) return 'thinking'
+  if (message.blocks?.some((block) => block.type === 'tool_result')) return 'tool_result'
+
+  const rawMessage = getTranscriptRawMessage(message)
+  const content = rawMessage?.content
+  if (Array.isArray(content)) {
+    if (content.some((item) => Boolean(item) && typeof item === 'object' && (item as Record<string, unknown>).type === 'tool_result')) {
+      return 'tool_result'
+    }
+    if (content.some((item) => Boolean(item) && typeof item === 'object' && (item as Record<string, unknown>).type === 'thinking')) {
+      return 'thinking'
+    }
+    if (content.some((item) => Boolean(item) && typeof item === 'object' && (item as Record<string, unknown>).type === 'user')) {
+      return 'user'
+    }
+  }
+
+  if (message.role === 'user') return 'user'
+  if (message.role === 'assistant') return 'assistant'
+  return 'unknown'
 }

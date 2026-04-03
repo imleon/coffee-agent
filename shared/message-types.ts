@@ -1,5 +1,11 @@
-import type { SDKMessage } from '@anthropic-ai/claude-agent-sdk'
-import type { TranscriptBlock, TranscriptMessage } from './transcript-normalizer.js'
+import type { SDKMessage, PermissionUpdate } from '@anthropic-ai/claude-agent-sdk'
+import type {
+  TranscriptAssistantUsage,
+  TranscriptBlock,
+  TranscriptLivePreviewState,
+  TranscriptMessage,
+  TranscriptSemanticKind,
+} from './transcript-normalizer.js'
 
 export type SessionRunState = 'idle' | 'queued' | 'running' | 'requires_action' | 'completed' | 'failed' | 'cancelled'
 export type SessionLifecycleState = SessionRunState
@@ -12,6 +18,225 @@ export interface SessionSummary {
   title: string
   updatedAt: number
 }
+
+export interface TranscriptVisibilityPolicy {
+  defaultHidden: boolean
+  transcriptOnly: boolean
+}
+
+export interface TranscriptLinkage {
+  messageId: string | null
+  parentId: string | null
+  toolUseIds: string[]
+  toolResultForIds: string[]
+}
+
+export interface TranscriptAtom {
+  id: string
+  source: 'history' | 'live'
+  order: {
+    timestamp: number
+    sequence?: number
+    sourceIndex: number
+  }
+  message: SessionMessage
+  role: SessionMessage['role']
+  semanticKind: TranscriptSemanticKind
+  visibility: TranscriptVisibilityPolicy
+  linkage: TranscriptLinkage
+  assistant: {
+    stopReason?: string | null
+    model?: string | null
+    usage?: TranscriptAssistantUsage | null
+  }
+  meta: {
+    isMeta: boolean
+    optimistic?: boolean
+    localId?: string
+    raw?: unknown
+  }
+}
+
+export interface DisplayFragmentText {
+  type: 'text'
+  text: string
+}
+
+export interface DisplayFragmentThinking {
+  type: 'thinking'
+  text?: string
+  redacted?: boolean
+  defaultHidden: boolean
+}
+
+export interface DisplayFragmentToolUse {
+  type: 'tool_use'
+  name: string
+  toolUseId?: string
+  input?: unknown
+  grouped?: boolean
+}
+
+export interface ToolResultDisplayMeta {
+  previewText: string
+  lineCount: number
+  charCount: number
+  defaultExpanded: boolean
+}
+
+export interface DisplayFragmentToolResult {
+  type: 'tool_result'
+  toolUseId?: string
+  output?: unknown
+  attachedToParent?: boolean
+  defaultCollapsed?: boolean
+  display?: ToolResultDisplayMeta
+}
+
+export interface DisplayFragmentSummary {
+  type: 'summary'
+  text: string
+  defaultCollapsed: boolean
+}
+
+export type DisplayFragment =
+  | DisplayFragmentText
+  | DisplayFragmentThinking
+  | DisplayFragmentToolUse
+  | DisplayFragmentToolResult
+  | DisplayFragmentSummary
+
+export interface DisplayAssistantFooter {
+  stopReason?: string | null
+  model?: string | null
+  usage?: TranscriptAssistantUsage | null
+  executionDurationMs?: number | null
+}
+
+export interface UserDisplayItem {
+  kind: 'user'
+  id: string
+  key: string
+  timestamp: number
+  atomIds: string[]
+  message: SessionMessage
+}
+
+export interface AssistantDisplayItem {
+  kind: 'assistant'
+  id: string
+  key: string
+  timestamp: number
+  atomIds: string[]
+  messages: SessionMessage[]
+  anchorMessage: SessionMessage
+  fragments: DisplayFragment[]
+  footer?: DisplayAssistantFooter
+  overlays?: TimelineOverlayItem[]
+}
+
+export interface GroupedToolUseEntry {
+  toolUseId?: string
+  name: string
+  input?: unknown
+  result?: unknown
+  resultDisplay?: ToolResultDisplayMeta
+}
+
+export type DisplayLifecycleStatus = 'streaming' | 'completed' | 'errored'
+
+export interface GroupedToolUseDisplayItem {
+  kind: 'grouped_tool_use'
+  id: string
+  key: string
+  timestamp: number
+  atomIds: string[]
+  toolName: string
+  toolUses: GroupedToolUseEntry[]
+  anchorMessage: SessionMessage
+  footer?: DisplayAssistantFooter
+  status: DisplayLifecycleStatus
+  overlays?: TimelineOverlayItem[]
+}
+
+export interface CollapsedToolBatchSummary {
+  readCount: number
+  searchCount: number
+  listCount: number
+  bashCount: number
+  latestHint?: string
+}
+
+export interface CollapsedToolBatchDisplayItem {
+  kind: 'collapsed_tool_batch'
+  id: string
+  key: string
+  timestamp: number
+  atomIds: string[]
+  batchKind: 'read_search' | 'meta_ops'
+  summary: CollapsedToolBatchSummary
+  items: Array<AssistantDisplayItem | GroupedToolUseDisplayItem>
+  anchorMessage: SessionMessage
+  footer?: DisplayAssistantFooter
+  status: DisplayLifecycleStatus
+  overlays?: TimelineOverlayItem[]
+}
+
+export interface SummaryDisplayItem {
+  kind: 'summary'
+  id: string
+  key: string
+  timestamp: number
+  atomIds: string[]
+  content: string
+  summaryType: 'post_turn' | 'compact' | 'synthetic'
+  defaultCollapsed: boolean
+  anchorMessage: SessionMessage
+}
+
+export type TimelineOverlayKind = 'streaming_text' | 'streaming_thinking' | 'streaming_tool_use' | 'streaming_progress'
+
+export interface TimelineOverlayAnchor {
+  scopeKey: string
+  messageId?: string
+  parentToolUseId?: string | null
+}
+
+export interface TimelineLivePreviewItem {
+  kind: 'live_preview'
+  layer: 'overlay'
+  overlayKind: TimelineOverlayKind
+  anchor: TimelineOverlayAnchor
+  id: string
+  key: string
+  timestamp: number
+  preview: TranscriptLivePreviewState
+}
+
+export interface LivePreviewMapEntry {
+  scopeKey: string
+  preview: TranscriptLivePreviewState
+}
+
+export type TimelineRenderableItem = DisplayItem | TimelineLivePreviewItem
+export type TimelineOverlayItem = TimelineLivePreviewItem
+
+export interface TranscriptLookup {
+  toolUseAtomsByToolUseId: Map<string, TranscriptAtom>
+  toolResultAtomsByToolUseId: Map<string, TranscriptAtom>
+  atomsByMessageId: Map<string, TranscriptAtom[]>
+  atomsByParentId: Map<string, TranscriptAtom[]>
+  siblingToolUseIdsByToolUseId: Map<string, string[]>
+  resolvedToolUseIds: Set<string>
+}
+
+export type DisplayItem =
+  | UserDisplayItem
+  | AssistantDisplayItem
+  | GroupedToolUseDisplayItem
+  | CollapsedToolBatchDisplayItem
+  | SummaryDisplayItem
+
 
 export type ChannelType = 'web' | 'lark' | 'discord'
 
@@ -61,6 +286,14 @@ export interface LarkStreamingState {
   finalizedAt?: number
 }
 
+export interface PermissionSuggestion {
+  action: PermissionUpdate['type'] | 'allow'
+  label?: string
+  description?: string
+  scope?: string
+  raw: PermissionUpdate | Record<string, unknown>
+}
+
 export interface PendingInteractionBase {
   id: string
   kind: 'permission' | 'elicitation'
@@ -78,6 +311,7 @@ export interface PendingPermissionInteraction extends PendingInteractionBase {
   blockedPath?: string
   toolUseId?: string
   agentId?: string
+  permissionSuggestions?: PermissionSuggestion[]
 }
 
 export interface PendingElicitationInteraction extends PendingInteractionBase {
@@ -203,7 +437,7 @@ export type RunnerAgentInput = {
 export type RunnerCommand =
   | { type: 'run.start'; input: RunnerAgentInput }
   | { type: 'run.cancel' }
-  | { type: 'interaction.permission.respond'; permissionId: string; decision: 'approve' | 'deny' }
+  | { type: 'interaction.permission.respond'; permissionId: string; decision: 'approve' | 'deny'; selectedSuggestion?: PermissionSuggestion | null }
   | { type: 'interaction.elicitation.respond'; requestId: string; response: { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, unknown> } }
 
 export type RunnerRuntimeEvent =
@@ -212,7 +446,7 @@ export type RunnerRuntimeEvent =
   | { type: 'run.completed'; messageCount: number; sessionId?: string }
   | { type: 'run.failed'; error: string; stack?: string; sessionId?: string }
   | { type: 'run.cancelled'; sessionId?: string }
-  | ({ type: 'sdk.message'; payload: SDKMessage; parsed?: SessionMessage } & RuntimeEnvelopeBase)
+  | ({ type: 'sdk.message'; payload: SDKMessage; parsed?: SessionMessage; livePreview?: TranscriptLivePreviewState } & RuntimeEnvelopeBase)
   | ({ type: 'sdk.control.requested'; interaction: PendingInteraction; payload?: unknown } & RuntimeEnvelopeBase)
   | ({ type: 'sdk.control.resolved'; interaction: PendingInteraction; payload?: unknown } & RuntimeEnvelopeBase)
   | { type: 'sdk.transport'; event: SdkTransportEvent }
@@ -224,19 +458,21 @@ export type SessionEvent =
   | { type: 'session.run.completed'; runId: string; sessionId?: string; exitCode?: number | null; error?: string }
   | { type: 'session.run.failed'; runId?: string; sessionId?: string; error: string }
   | { type: 'session.run.cancelled'; runId: string; sessionId?: string }
-  | ({ type: 'session.sdk.message'; runId: string; payload: SDKMessage; parsed?: SessionMessage } & RuntimeEnvelopeBase)
+  | ({ type: 'session.sdk.message'; runId: string; payload: SDKMessage; parsed?: SessionMessage; livePreview?: TranscriptLivePreviewState } & RuntimeEnvelopeBase)
   | ({ type: 'session.sdk.control.requested'; runId: string; interaction: PendingInteraction; payload?: unknown } & RuntimeEnvelopeBase)
   | ({ type: 'session.sdk.control.resolved'; runId: string; interaction: PendingInteraction; payload?: unknown } & RuntimeEnvelopeBase)
   | { type: 'session.sdk.transport'; runId: string; event: SdkTransportEvent }
   | { type: 'session.error'; runId?: string; error: string }
 
-export type SdkMessageLayer = 'business-message' | 'run-state' | 'debug-observability'
+export type SdkMessageLayer = 'business-message' | 'run-state' | 'debug-observability' | 'live-preview'
 
 export function getSdkMessageLayer(message: SDKMessage): SdkMessageLayer {
   switch (message.type) {
     case 'assistant':
     case 'user':
       return 'business-message'
+    case 'stream_event':
+      return 'live-preview'
     case 'result':
     case 'tool_progress':
     case 'tool_use_summary':
@@ -255,7 +491,6 @@ export function getSdkMessageLayer(message: SDKMessage): SdkMessageLayer {
     case 'auth_status':
     case 'prompt_suggestion':
     case 'rate_limit_event':
-    case 'stream_event':
       return 'debug-observability'
     default:
       return 'debug-observability'
@@ -266,8 +501,8 @@ export function isBusinessSdkMessage(message: SDKMessage): boolean {
   return getSdkMessageLayer(message) === 'business-message'
 }
 
-export function isRunStateSdkMessage(message: SDKMessage): boolean {
-  return getSdkMessageLayer(message) === 'run-state'
+export function isLivePreviewSdkMessage(message: SDKMessage): boolean {
+  return getSdkMessageLayer(message) === 'live-preview'
 }
 
 export type StaticMetadataNodeKind = 'group' | 'object' | 'array' | 'string' | 'number' | 'boolean' | 'null' | 'union' | 'unknown'

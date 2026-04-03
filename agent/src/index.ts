@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import { query, type CanUseTool, type ElicitationRequest, type ElicitationResult, type PermissionResult, type Query, type SDKControlRequest, type SDKMessage } from '@anthropic-ai/claude-agent-sdk'
+import { query, type CanUseTool, type ElicitationRequest, type ElicitationResult, type PermissionResult, type PermissionUpdate, type Query, type SDKControlRequest, type SDKMessage } from '@anthropic-ai/claude-agent-sdk'
 import type {
   PendingInteraction,
+  PermissionSuggestion,
   RunnerAgentInput,
   RunnerCommand,
   RunnerRuntimeEvent,
@@ -10,7 +11,9 @@ import type {
   SessionMessage,
 } from '../../shared/message-types.js'
 import {
+  clearTranscriptLivePreviewState,
   normalizeSdkEnvelopeMessage,
+  reduceTranscriptLivePreviewState,
 } from '../../shared/transcript-normalizer.js'
 import { logAgent } from './logger.js'
 
@@ -92,31 +95,107 @@ function maybeTransportPayload(payload: unknown): { payload?: unknown } {
   return shouldIncludeTransportPayload() ? { payload } : {}
 }
 
-function summarizeSdkMessage(message: SDKMessage): string {
-  switch (message.type) {
-    case 'assistant': {
-      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
-      if (Array.isArray(message.message?.content)) return `assistant blocks=${message.message.content.length}`
-      return 'assistant message'
+function getStreamScopeKey(message: SDKMessage): string | null {
+  if (message.type !== 'stream_event') return null
+  const sessionId = extractSessionId(message) || currentSessionId || 'unknown-session'
+  const parentToolUseId = 'parent_tool_use_id' in message && typeof message.parent_tool_use_id === 'string'
+    ? message.parent_tool_use_id
+    : 'parent_tool_use_id' in message && message.parent_tool_use_id === null
+      ? 'root'
+      : 'root'
+  return `${sessionId}:${parentToolUseId}`
+}
+
+function getStreamIndex(message: SDKMessage): number | null {
+  if (message.type !== 'stream_event') return null
+  return 'index' in message.event && typeof message.event.index === 'number' ? message.event.index : null
+}
+
+function accumulateStreamEvent(message: SDKMessage, state: StreamAccumulatorState): SDKMessage {
+  if (message.type !== 'stream_event') return message
+  const scopeKey = getStreamScopeKey(message)
+  const index = getStreamIndex(message)
+  if (!scopeKey || index == null) return message
+  if (message.event.type !== 'content_block_delta') return message
+
+  if (message.event.delta.type === 'text_delta') {
+    const key = `${scopeKey}:${index}`
+    const next = `${state.textByScopeAndIndex.get(key) || ''}${message.event.delta.text}`
+    state.textByScopeAndIndex.set(key, next)
+    return {
+      ...message,
+      event: {
+        ...message.event,
+        delta: {
+          ...message.event.delta,
+          text: next,
+        },
+      },
     }
-    case 'user': {
-      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
-      if (Array.isArray(message.message?.content)) return `user blocks=${message.message.content.length}`
-      return 'user message'
+  }
+
+  if (message.event.delta.type === 'thinking_delta') {
+    const key = `${scopeKey}:${index}`
+    const next = `${state.thinkingByScopeAndIndex.get(key) || ''}${message.event.delta.thinking}`
+    state.thinkingByScopeAndIndex.set(key, next)
+    return {
+      ...message,
+      event: {
+        ...message.event,
+        delta: {
+          ...message.event.delta,
+          thinking: next,
+        },
+      },
     }
-    case 'result':
-      return typeof message.subtype === 'string' ? `result.${message.subtype}` : 'result'
-    case 'tool_progress':
-      return typeof message.tool_name === 'string' ? `tool ${message.tool_name}` : 'tool progress'
-    case 'tool_use_summary':
-      return typeof message.summary === 'string' ? summarizeValue(message.summary) : 'tool summary'
-    case 'system':
-      return typeof message.subtype === 'string' ? `system.${message.subtype}` : 'system'
-    default: {
-      const payload = message as Record<string, unknown>
-      const subtype = typeof payload.subtype === 'string' ? `.${payload.subtype}` : ''
-      return `${message.type}${subtype}`
+  }
+
+  if (message.event.delta.type === 'input_json_delta') {
+    const key = `${scopeKey}:${index}`
+    const next = `${state.toolInputByScopeAndIndex.get(key) || ''}${message.event.delta.partial_json}`
+    state.toolInputByScopeAndIndex.set(key, next)
+    return {
+      ...message,
+      event: {
+        ...message.event,
+        delta: {
+          ...message.event.delta,
+          partial_json: next,
+        },
+      },
     }
+  }
+
+  return message
+}
+
+function clearAccumulatedStreamScope(message: SDKMessage, state: StreamAccumulatorState): void {
+  const scopeKey = getStreamScopeKey(message)
+  if (!scopeKey) return
+  for (const map of [state.textByScopeAndIndex, state.thinkingByScopeAndIndex, state.toolInputByScopeAndIndex]) {
+    for (const key of [...map.keys()]) {
+      if (key.startsWith(`${scopeKey}:`)) map.delete(key)
+    }
+  }
+}
+
+function createScopedLivePreviewClear(state: {
+  scopeKey?: string
+  sessionId?: string
+  parentToolUseId?: string | null
+  messageId?: string
+  receivedAt?: number
+  sequence?: number
+}) {
+  if (!state.scopeKey) return undefined
+  return {
+    ...clearTranscriptLivePreviewState(),
+    scopeKey: state.scopeKey,
+    ...(state.sessionId !== undefined ? { sessionId: state.sessionId } : {}),
+    ...(state.parentToolUseId !== undefined ? { parentToolUseId: state.parentToolUseId } : {}),
+    ...(state.messageId !== undefined ? { messageId: state.messageId } : {}),
+    ...(state.receivedAt !== undefined ? { receivedAt: state.receivedAt } : {}),
+    ...(state.sequence !== undefined ? { sequence: state.sequence } : {}),
   }
 }
 
@@ -145,6 +224,7 @@ function normalizePermissionRequest(request: SDKControlRequest): PendingInteract
     blockedPath: typeof payload.blocked_path === 'string' ? payload.blocked_path : undefined,
     toolUseId: typeof payload.tool_use_id === 'string' ? payload.tool_use_id : undefined,
     agentId: typeof payload.agent_id === 'string' ? payload.agent_id : undefined,
+    permissionSuggestions: normalizePermissionSuggestions(Array.isArray(payload.permission_suggestions) ? payload.permission_suggestions as PermissionUpdate[] : undefined),
   }
 }
 
@@ -188,7 +268,12 @@ type PermissionRequest = {
   decisionReason?: string
   blockedPath?: string
   agentId?: string
-  permissionSuggestions?: unknown[]
+  permissionSuggestions?: PermissionUpdate[]
+}
+
+type PermissionResponse = {
+  decision: 'approve' | 'deny'
+  selectedSuggestion?: PermissionSuggestion | null
 }
 
 type ElicitationContentValue = string | number | boolean | string[]
@@ -198,13 +283,134 @@ type ElicitationResponse = {
   content?: Record<string, ElicitationContentValue>
 }
 
+type StreamAccumulatorState = {
+  textByScopeAndIndex: Map<string, string>
+  thinkingByScopeAndIndex: Map<string, string>
+  toolInputByScopeAndIndex: Map<string, string>
+}
+
+function createStreamAccumulatorState(): StreamAccumulatorState {
+  return {
+    textByScopeAndIndex: new Map(),
+    thinkingByScopeAndIndex: new Map(),
+    toolInputByScopeAndIndex: new Map(),
+  }
+}
+
+function normalizePermissionSuggestions(suggestions: PermissionUpdate[] | undefined): PermissionSuggestion[] | undefined {
+  if (!Array.isArray(suggestions) || suggestions.length === 0) return undefined
+
+  return suggestions.map((suggestion) => {
+    switch (suggestion.type) {
+      case 'addRules':
+      case 'replaceRules':
+      case 'removeRules': {
+        const ruleSummary = suggestion.rules
+          .map((rule) => rule.ruleContent ? `${rule.toolName} ${rule.ruleContent}` : rule.toolName)
+          .join(' · ')
+        return {
+          action: suggestion.type,
+          label: suggestion.destination === 'session' ? 'Allow for session' : 'Update rules',
+          description: ruleSummary || suggestion.destination,
+          scope: suggestion.destination,
+          raw: suggestion,
+        }
+      }
+      case 'setMode':
+        return {
+          action: suggestion.type,
+          label: `Set mode: ${suggestion.mode}`,
+          description: suggestion.destination,
+          scope: suggestion.destination,
+          raw: suggestion,
+        }
+      case 'addDirectories':
+      case 'removeDirectories':
+        return {
+          action: suggestion.type,
+          label: suggestion.type === 'addDirectories' ? 'Allow directories' : 'Remove directories',
+          description: suggestion.directories.join(' · '),
+          scope: suggestion.destination,
+          raw: suggestion,
+        }
+      default:
+        return {
+          action: 'allow',
+          label: 'Allow once',
+          raw: suggestion,
+        }
+    }
+  })
+}
+
+function getPermissionResult(request: PermissionRequest, response: PermissionResponse): PermissionResult {
+  if (response.decision === 'deny') {
+    return {
+      behavior: 'deny',
+      message: 'User denied this action.',
+      interrupt: true,
+      toolUseID: request.permissionId,
+      decisionClassification: 'user_reject',
+    }
+  }
+
+  const selectedRaw = response.selectedSuggestion?.raw
+  if (selectedRaw && typeof selectedRaw === 'object' && 'type' in selectedRaw) {
+    const permissionUpdate = selectedRaw as PermissionUpdate
+    return {
+      behavior: 'allow',
+      updatedInput: {},
+      updatedPermissions: [permissionUpdate],
+      toolUseID: request.permissionId,
+      decisionClassification: permissionUpdate.destination === 'session' ? 'user_permanent' : 'user_temporary',
+    }
+  }
+
+  return {
+    behavior: 'allow',
+    updatedInput: {},
+    toolUseID: request.permissionId,
+    decisionClassification: 'user_temporary',
+  }
+}
+
+function summarizeSdkMessage(message: SDKMessage): string {
+  switch (message.type) {
+    case 'assistant': {
+      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
+      if (Array.isArray(message.message?.content)) return `assistant blocks=${message.message.content.length}`
+      return 'assistant message'
+    }
+    case 'user': {
+      if (typeof message.message?.content === 'string') return summarizeValue(message.message.content)
+      if (Array.isArray(message.message?.content)) return `user blocks=${message.message.content.length}`
+      return 'user message'
+    }
+    case 'result':
+      return typeof message.subtype === 'string' ? `result.${message.subtype}` : 'result'
+    case 'tool_progress':
+      return typeof message.tool_name === 'string' ? `tool ${message.tool_name}` : 'tool progress'
+    case 'tool_use_summary':
+      return typeof message.summary === 'string' ? summarizeValue(message.summary) : 'tool summary'
+    case 'system':
+      return typeof message.subtype === 'string' ? `system.${message.subtype}` : 'system'
+    default: {
+      const payload = message as Record<string, unknown>
+      const subtype = typeof payload.subtype === 'string' ? `.${payload.subtype}` : ''
+      return `${message.type}${subtype}`
+    }
+  }
+}
+
 const startDeferred = createDeferred<RunnerAgentInput>()
-const permissionWaiters = new Map<string, (decision: 'approve' | 'deny') => void>()
+const permissionWaiters = new Map<string, (response: PermissionResponse) => void>()
 const elicitationWaiters = new Map<string, (response: ElicitationResponse) => void>()
 let activeQuery: Query | null = null
 let currentSessionId: string | undefined
 let cancelRequested = false
 let sdkMessageCount = 0
+let livePreviewState = clearTranscriptLivePreviewState()
+let streamAccumulatorState = createStreamAccumulatorState()
 
 function handleCommand(command: RunnerCommand) {
   switch (command.type) {
@@ -215,6 +421,7 @@ function handleCommand(command: RunnerCommand) {
       logAgent('info', 'agent:permission:response', {
         permissionId: command.permissionId.slice(0, 8),
         decision: command.decision,
+        selectedAction: command.selectedSuggestion?.action,
       })
       writeTransportEvent({
         direction: 'inbound',
@@ -222,13 +429,19 @@ function handleCommand(command: RunnerCommand) {
         requestId: command.permissionId,
         toolUseId: command.permissionId,
         payloadSummary: command.decision,
-        ...maybeTransportPayload({ decision: command.decision }),
+        ...maybeTransportPayload({
+          decision: command.decision,
+          ...(command.selectedSuggestion !== undefined ? { selectedSuggestion: command.selectedSuggestion } : {}),
+        }),
         ...nextEnvelope(currentSessionId),
       })
       const resolve = permissionWaiters.get(command.permissionId)
       if (resolve) {
         permissionWaiters.delete(command.permissionId)
-        resolve(command.decision)
+        resolve({
+          decision: command.decision,
+          ...(command.selectedSuggestion !== undefined ? { selectedSuggestion: command.selectedSuggestion } : {}),
+        })
       }
       break
     }
@@ -314,6 +527,7 @@ function startCommandReader() {
 }
 
 async function waitForPermission(request: PermissionRequest, signal: AbortSignal): Promise<PermissionResult> {
+  const normalizedSuggestions = normalizePermissionSuggestions(request.permissionSuggestions)
   const interaction: PendingInteraction = {
     id: request.permissionId,
     kind: 'permission',
@@ -327,6 +541,7 @@ async function waitForPermission(request: PermissionRequest, signal: AbortSignal
     blockedPath: request.blockedPath,
     toolUseId: request.permissionId,
     agentId: request.agentId,
+    permissionSuggestions: normalizedSuggestions,
   }
 
   logAgent('info', 'agent:permission:requested', {
@@ -365,7 +580,7 @@ async function waitForPermission(request: PermissionRequest, signal: AbortSignal
     ...(currentSessionId ? { sessionId: currentSessionId } : {}),
   })
 
-  const decision = await new Promise<'approve' | 'deny'>((resolve, reject) => {
+  const response = await new Promise<PermissionResponse>((resolve, reject) => {
     permissionWaiters.set(request.permissionId, resolve)
     signal.addEventListener(
       'abort',
@@ -383,13 +598,14 @@ async function waitForPermission(request: PermissionRequest, signal: AbortSignal
   }
   logAgent('info', 'agent:permission:resolved', {
     permissionId: request.permissionId.slice(0, 8),
-    decision,
+    decision: response.decision,
+    selectedAction: response.selectedSuggestion?.action,
     sessionId: currentSessionId?.slice(0, 8),
   })
   writeRuntimeEvent({
     type: 'sdk.control.resolved',
     interaction: resolvedInteraction,
-    payload: { decision },
+    payload: response,
     ...nextEnvelope(currentSessionId),
   })
   writeRuntimeEvent({
@@ -398,21 +614,7 @@ async function waitForPermission(request: PermissionRequest, signal: AbortSignal
     ...(currentSessionId ? { sessionId: currentSessionId } : {}),
   })
 
-  if (decision === 'approve') {
-    return {
-      behavior: 'allow',
-      toolUseID: request.permissionId,
-      decisionClassification: 'user_temporary',
-    }
-  }
-
-  return {
-    behavior: 'deny',
-    message: 'User denied this action.',
-    interrupt: true,
-    toolUseID: request.permissionId,
-    decisionClassification: 'user_reject',
-  }
+  return getPermissionResult(request, response)
 }
 
 async function waitForElicitation(request: ElicitationRequest, signal: AbortSignal): Promise<ElicitationResult> {
@@ -517,20 +719,22 @@ function handleSdkMessage(message: SDKMessage) {
     })
   }
 
+  const normalizedMessage = accumulateStreamEvent(message, streamAccumulatorState)
+
   writeTransportEvent({
     direction: 'outbound',
     eventName: 'message',
-    sdkType: message.type,
-    sdkSubtype: 'subtype' in message && typeof message.subtype === 'string' ? message.subtype : undefined,
-    payloadSummary: summarizeSdkMessage(message),
-    ...maybeTransportPayload(message),
+    sdkType: normalizedMessage.type,
+    sdkSubtype: 'subtype' in normalizedMessage && typeof normalizedMessage.subtype === 'string' ? normalizedMessage.subtype : undefined,
+    payloadSummary: summarizeSdkMessage(normalizedMessage),
+    ...maybeTransportPayload(normalizedMessage),
     ...nextEnvelope(currentSessionId),
   })
 
-  if (message.type === 'system' && message.subtype === 'session_state_changed') {
+  if (normalizedMessage.type === 'system' && normalizedMessage.subtype === 'session_state_changed') {
     writeRuntimeEvent({
       type: 'run.state_changed',
-      state: message.state === 'running' || message.state === 'requires_action' || message.state === 'idle' ? message.state : 'idle',
+      state: normalizedMessage.state === 'running' || normalizedMessage.state === 'requires_action' || normalizedMessage.state === 'idle' ? normalizedMessage.state : 'idle',
       ...(currentSessionId ? { sessionId: currentSessionId } : {}),
     })
   }
@@ -538,16 +742,48 @@ function handleSdkMessage(message: SDKMessage) {
   if (sdkMessageCount === 1 || sdkMessageCount % EVENT_LOG_INTERVAL === 0) {
     logAgent('debug', 'agent:query:event', {
       count: sdkMessageCount,
-      type: message.type,
+      type: normalizedMessage.type,
       sessionId: currentSessionId?.slice(0, 8),
     })
   }
 
+  const envelope = nextEnvelope(currentSessionId)
+  const livePreview = normalizedMessage.type === 'stream_event'
+    ? reduceTranscriptLivePreviewState(livePreviewState, {
+        ...normalizedMessage,
+        ...envelope,
+      })
+    : undefined
+  const parsedMessage = normalizedMessage.type === 'assistant' || normalizedMessage.type === 'user'
+    ? toParsedSessionMessage(normalizedMessage)
+    : undefined
+
+  if (livePreview) {
+    livePreviewState = livePreview
+  }
+
+  let livePreviewClear
+  if (parsedMessage && livePreviewState.scopeKey) {
+    livePreviewClear = createScopedLivePreviewClear({
+      scopeKey: livePreviewState.scopeKey,
+      sessionId: currentSessionId,
+      parentToolUseId: livePreviewState.parentToolUseId,
+      messageId: livePreviewState.messageId,
+      receivedAt: envelope.receivedAt,
+      sequence: envelope.sequence,
+    })
+    livePreviewState = clearTranscriptLivePreviewState()
+  }
+  if (normalizedMessage.type === 'assistant' || normalizedMessage.type === 'user' || (normalizedMessage.type === 'stream_event' && normalizedMessage.event.type === 'message_stop')) {
+    clearAccumulatedStreamScope(normalizedMessage, streamAccumulatorState)
+  }
+
   writeRuntimeEvent({
     type: 'sdk.message',
-    payload: message,
-    ...(message.type === 'assistant' || message.type === 'user' ? { parsed: toParsedSessionMessage(message) } : {}),
-    ...nextEnvelope(currentSessionId),
+    payload: normalizedMessage,
+    ...(parsedMessage ? { parsed: parsedMessage } : {}),
+    ...(livePreview ?? livePreviewClear ? { livePreview: livePreview ?? livePreviewClear } : {}),
+    ...envelope,
   })
 }
 
@@ -570,6 +806,8 @@ async function main(): Promise<void> {
   cancelRequested = false
   eventSequence = 0
   sdkMessageCount = 0
+  livePreviewState = clearTranscriptLivePreviewState()
+  streamAccumulatorState = createStreamAccumulatorState()
 
   logAgent('info', 'agent:run:start', {
     promptLength: input.prompt.length,

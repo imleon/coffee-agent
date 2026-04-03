@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { CONFIG } from './config.js'
 import { createOutputParser, type AgentEvent } from './agent-output-parser.js'
-import type { RunnerRuntimeEvent, SessionEvent } from '../shared/message-types.js'
+import type { RunnerRuntimeEvent, SessionEvent, PermissionSuggestion } from '../shared/message-types.js'
 import { createLogger, shortId } from './logger.js'
 import { appendSessionRuntimeLog, appendSessionTransportLog } from './transport-logs.js'
 export type { AgentEvent } from './agent-output-parser.js'
@@ -27,7 +27,7 @@ export interface AgentRunResult {
 
 export interface AgentRunHandle {
   done: Promise<AgentRunResult>
-  respondToPermission: (permissionId: string, decision: 'approve' | 'deny') => void
+  respondToPermission: (permissionId: string, decision: 'approve' | 'deny', selectedSuggestion?: PermissionSuggestion | null) => void
   respondToElicitation: (requestId: string, response: { action: 'accept' | 'decline' | 'cancel'; content?: Record<string, string | number | boolean | string[]> }) => void
   cancel: () => void
 }
@@ -77,6 +77,7 @@ function toServerEvent(runId: string, event: RunnerRuntimeEvent): ServerEvent | 
         runId,
         payload: event.payload,
         ...(event.parsed ? { parsed: event.parsed } : {}),
+        ...(event.livePreview ? { livePreview: event.livePreview } : {}),
         receivedAt: event.receivedAt,
         sequence: event.sequence,
         ...(event.sessionId ? { sessionId: event.sessionId } : {}),
@@ -246,8 +247,13 @@ export function createAgentRun(input: AgentInput, onEvent: AgentEventHandler, si
 
   return {
     done,
-    respondToPermission(permissionId, decision) {
-      writeCommand(child, { type: 'interaction.permission.respond', permissionId, decision })
+    respondToPermission(permissionId, decision, selectedSuggestion) {
+      writeCommand(child, {
+        type: 'interaction.permission.respond',
+        permissionId,
+        decision,
+        ...(selectedSuggestion !== undefined ? { selectedSuggestion } : {}),
+      })
     },
     respondToElicitation(requestId, response) {
       writeCommand(child, { type: 'interaction.elicitation.respond', requestId, response })

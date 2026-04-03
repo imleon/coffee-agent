@@ -6,6 +6,7 @@ import { SessionBindingStore } from './session-bindings.js'
 import type {
   ChannelInboundMessage,
   PendingInteraction,
+  PermissionSuggestion,
   SessionEvent,
   SessionRunState,
 } from '../shared/message-types.js'
@@ -139,10 +140,10 @@ export class RunCoordinator {
     return true
   }
 
-  respondToPermission(runId: string, permissionId: string, decision: PermissionDecision): boolean {
+  respondToPermission(runId: string, permissionId: string, decision: PermissionDecision, selectedSuggestion?: PermissionSuggestion | null): boolean {
     const record = this.runs.get(runId)
     if (!record?.handle) return false
-    record.handle.respondToPermission(permissionId, decision)
+    record.handle.respondToPermission(permissionId, decision, selectedSuggestion)
     return true
   }
 

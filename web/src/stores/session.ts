@@ -1,94 +1,52 @@
 import { defineStore } from 'pinia'
 import { computed, ref } from 'vue'
 import type {
+  AssistantDisplayItem,
+  CollapsedToolBatchDisplayItem,
+  DisplayItem,
+  GroupedToolUseDisplayItem,
+  LivePreviewMapEntry,
   PendingInteraction,
+  PermissionSuggestion,
   SessionEvent,
   SessionMessage,
   SessionMessageBlock,
   SessionRunState,
   SessionSummary,
-  SessionTransportLogEntry,
-  SdkMessageLayer,
+  TimelineLivePreviewItem,
+  TimelineRenderableItem,
+  TranscriptAtom,
 } from '../../../shared/message-types.js'
 import {
   getSdkMessageLayer,
   isBusinessSdkMessage,
-  isRunStateSdkMessage,
+  isLivePreviewSdkMessage,
 } from '../../../shared/message-types.js'
+import { buildDisplayItems, buildTranscriptAtom } from '../../../shared/transcript-display.js'
 import {
+  getTranscriptMessageId,
+  getTranscriptParentMessageId,
   normalizeSdkEnvelopeMessage,
   normalizeStoredTranscriptMessage,
 } from '../../../shared/transcript-normalizer.js'
 import { createDebugLogger } from '../lib/debug.js'
 
 export type {
+  TimelineRenderableItem as TimelineItem,
   PendingInteraction,
   SessionEvent,
   SessionMessage,
   SessionMessageBlock,
   SessionRunState,
   SessionSummary,
+  TimelineRenderableItem,
+  TranscriptAtom,
 }
 
-export interface SdkTimelineItem {
-  kind: 'sdk-message'
-  key: string
-  event: Extract<SessionEvent, { type: 'session.sdk.message' }>
-  timestamp: number
-}
-
-export interface RunStateSdkEventItem {
-  kind: 'run-state-event'
-  key: string
-  event: Extract<SessionEvent, { type: 'session.sdk.message' }>
-  layer: SdkMessageLayer
-  timestamp: number
-}
-
-export interface HistoryUserMessageTimelineItem {
-  kind: 'history-user-message'
-  key: string
-  message: HistoryMessage
-  timestamp: number
-}
-
-export interface HistorySingleMessageTimelineItem {
-  kind: 'history-message'
-  key: string
-  message: HistoryMessage
-  timestamp: number
-  executionDurationMs: number | null
-}
-
-export interface HistoryAssistantThreadItem {
-  key: string
-  message: HistoryMessage
-  depth: number
-  timestamp: number
-}
-
-export interface HistoryAssistantThreadTimelineItem {
-  kind: 'history-assistant-thread'
-  key: string
-  rootMessage: HistoryMessage
-  items: HistoryAssistantThreadItem[]
-  timestamp: number
-  executionDurationMs: number | null
-}
-
-export type HistoryTimelineItem = HistoryUserMessageTimelineItem | HistorySingleMessageTimelineItem | HistoryAssistantThreadTimelineItem
-
-export type TimelineItem = SdkTimelineItem | HistoryTimelineItem
 
 interface HealthResponse {
   status?: string
   authEnabled?: boolean
-}
-
-interface TransportLogsResponse {
-  items?: SessionTransportLogEntry[]
-  hasMore?: boolean
-  nextCursor?: number | null
 }
 
 interface SessionMessagesResponse {
@@ -105,149 +63,6 @@ const OPTIMISTIC_USER_MATCH_WINDOW_MS = 30_000
 type HistoryMessage = SessionMessage & {
   optimistic?: boolean
   localId?: string
-}
-
-function getHistoryMessageUuid(message: HistoryMessage): string | null {
-  const raw = message.raw
-  if (!raw || typeof raw !== 'object') return null
-  return typeof (raw as Record<string, unknown>).uuid === 'string' ? (raw as Record<string, unknown>).uuid as string : null
-}
-
-function getHistoryMessageParentUuid(message: HistoryMessage): string | null {
-  const raw = message.raw
-  if (!raw || typeof raw !== 'object') return null
-  return typeof (raw as Record<string, unknown>).parentUuid === 'string' ? (raw as Record<string, unknown>).parentUuid as string : null
-}
-
-function getHistoryMessageTimestamp(message: HistoryMessage, fallback: number): number {
-  return typeof message.timestamp === 'number' ? message.timestamp : fallback
-}
-
-function getHistoryMessageKey(message: HistoryMessage, index: number): string {
-  return getHistoryMessageUuid(message) ?? `history-${index}`
-}
-
-function getHistoryRawMessage(message: HistoryMessage): Record<string, unknown> | null {
-  const raw = message.raw
-  if (!raw || typeof raw !== 'object') return null
-  const rawMessage = (raw as Record<string, unknown>).message
-  return rawMessage && typeof rawMessage === 'object' ? rawMessage as Record<string, unknown> : null
-}
-
-function hasHistoryRawContentType(message: HistoryMessage, expectedType: string): boolean {
-  const rawMessage = getHistoryRawMessage(message)
-  if (!rawMessage) return false
-  const content = rawMessage.content
-
-  if (Array.isArray(content)) {
-    return content.some((item) => Boolean(item) && typeof item === 'object' && (item as Record<string, unknown>).type === expectedType)
-  }
-
-  return Boolean(content && typeof content === 'object' && (content as Record<string, unknown>).type === expectedType)
-}
-
-function getHistoryMessageSemanticType(message: HistoryMessage): string {
-  if (message.blocks?.some((block) => block.type === 'tool_result')) return 'tool_result'
-  if (hasHistoryRawContentType(message, 'tool_result')) return 'tool_result'
-  if (hasHistoryRawContentType(message, 'user')) return 'user'
-  return message.role
-}
-
-function isToolResultHistoryMessage(message: HistoryMessage): boolean {
-  return getHistoryMessageSemanticType(message) === 'tool_result'
-}
-
-function getHistoryMessageStopReason(message: HistoryMessage): string | null {
-  const rawMessage = getHistoryRawMessage(message)
-  if (!rawMessage) return null
-  const stopReason = rawMessage.stop_reason
-  return typeof stopReason === 'string' && stopReason ? stopReason : null
-}
-
-function isRightSideHistoryMessage(message: HistoryMessage): boolean {
-  return message.role === 'user' && getHistoryMessageSemanticType(message) === 'user'
-}
-
-function getDurationSincePreviousCard(currentTimestamp: number, previousCardTimestamp: number | null): number | null {
-  if (typeof previousCardTimestamp !== 'number' || !Number.isFinite(previousCardTimestamp)) return null
-  const duration = currentTimestamp - previousCardTimestamp
-  return duration >= 0 ? duration : null
-}
-
-function buildHistoryTimeline(messages: HistoryMessage[]): HistoryTimelineItem[] {
-  const timeline: HistoryTimelineItem[] = []
-  const leftBucket: Array<{ key: string; message: HistoryMessage; timestamp: number }> = []
-  let previousCardTimestamp: number | null = null
-
-  const flushLeftBucket = () => {
-    if (!leftBucket.length) return
-
-    if (leftBucket.length === 1) {
-      const item = leftBucket[0]
-      timeline.push({
-        kind: 'history-message',
-        key: `history-${item.key}`,
-        message: item.message,
-        timestamp: item.timestamp,
-        executionDurationMs: getDurationSincePreviousCard(item.timestamp, previousCardTimestamp),
-      })
-      previousCardTimestamp = item.timestamp
-      leftBucket.length = 0
-      return
-    }
-
-    const rootItem = leftBucket[0]
-    const lastItem = leftBucket[leftBucket.length - 1]
-    timeline.push({
-      kind: 'history-assistant-thread',
-      key: `history-assistant-thread-${rootItem.key}`,
-      rootMessage: rootItem.message,
-      items: leftBucket.map((item, depth) => ({
-        key: `${item.key}-${depth}`,
-        message: item.message,
-        depth,
-        timestamp: item.timestamp,
-      })),
-      timestamp: lastItem.timestamp,
-      executionDurationMs: getDurationSincePreviousCard(lastItem.timestamp, previousCardTimestamp),
-    })
-    previousCardTimestamp = lastItem.timestamp
-    leftBucket.length = 0
-  }
-
-  for (const [index, message] of messages.entries()) {
-    const timestamp = getHistoryMessageTimestamp(message, index)
-    const key = getHistoryMessageKey(message, index)
-
-    if (isRightSideHistoryMessage(message)) {
-      flushLeftBucket()
-      timeline.push({
-        kind: 'history-user-message',
-        key: `history-user-${key}`,
-        message,
-        timestamp,
-      })
-      previousCardTimestamp = timestamp
-      continue
-    }
-
-    if (leftBucket.length > 0 && !getHistoryMessageParentUuid(message)) {
-      flushLeftBucket()
-    }
-
-    leftBucket.push({
-      key,
-      message,
-      timestamp,
-    })
-
-    if (getHistoryMessageStopReason(message)) {
-      flushLeftBucket()
-    }
-  }
-
-  flushLeftBucket()
-  return timeline
 }
 
 function normalizeSession(item: any): SessionSummary {
@@ -289,6 +104,139 @@ function isMatchingOptimisticUserMessage(message: HistoryMessage, candidate: Ses
   return Math.abs(messageTimestamp - timestamp) <= OPTIMISTIC_USER_MATCH_WINDOW_MS
 }
 
+function getLivePreviewScopeKey(preview: { scopeKey?: string; sessionId?: string; parentToolUseId?: string | null }): string {
+  if (preview.scopeKey) return preview.scopeKey
+  const sessionId = preview.sessionId || 'unknown-session'
+  const parentToolUseId = preview.parentToolUseId ?? 'root'
+  return `${sessionId}:${parentToolUseId}`
+}
+
+function clearLivePreviewEntryByScope(
+  entries: LivePreviewMapEntry[],
+  preview: { scopeKey?: string; sessionId?: string; parentToolUseId?: string | null }
+): LivePreviewMapEntry[] {
+  const scopeKey = getLivePreviewScopeKey(preview)
+  return entries.filter((entry) => entry.scopeKey !== scopeKey)
+}
+
+function upsertLivePreviewEntry(entries: LivePreviewMapEntry[], preview: LivePreviewMapEntry['preview']): LivePreviewMapEntry[] {
+  const scopeKey = getLivePreviewScopeKey(preview)
+  const nextEntry: LivePreviewMapEntry = { scopeKey, preview }
+  const index = entries.findIndex((entry) => entry.scopeKey === scopeKey)
+  if (index === -1) return [...entries, nextEntry]
+  return entries.map((entry, entryIndex) => (entryIndex === index ? nextEntry : entry))
+}
+
+function pruneLivePreviewEntries(entries: LivePreviewMapEntry[]): LivePreviewMapEntry[] {
+  return entries.filter(({ preview }) => preview.active || preview.blocks.length > 0)
+}
+
+function clearLivePreviewEntriesForMessage(entries: LivePreviewMapEntry[], message: SessionMessage | null): LivePreviewMapEntry[] {
+  if (!message || message.role !== 'assistant') return entries
+
+  const messageId = getTranscriptMessageId(message)
+  const parentMessageId = getTranscriptParentMessageId(message)
+
+  return entries.filter(({ preview }) => {
+    if (messageId && preview.messageId === messageId) return false
+    if (parentMessageId && preview.parentToolUseId === parentMessageId) return false
+    return true
+  })
+}
+
+function getLivePreviewOverlayKind(preview: LivePreviewMapEntry['preview']): TimelineLivePreviewItem['overlayKind'] {
+  switch (preview.phase) {
+    case 'thinking':
+      return 'streaming_thinking'
+    case 'tool-input':
+      return 'streaming_tool_use'
+    case 'responding':
+      return 'streaming_text'
+    default:
+      return 'streaming_progress'
+  }
+}
+
+function isOverlayHostItem(item: DisplayItem): item is AssistantDisplayItem | GroupedToolUseDisplayItem | CollapsedToolBatchDisplayItem {
+  return item.kind === 'assistant' || item.kind === 'grouped_tool_use' || item.kind === 'collapsed_tool_batch'
+}
+
+function getDisplayItemToolUseIds(item: AssistantDisplayItem | GroupedToolUseDisplayItem | CollapsedToolBatchDisplayItem): string[] {
+  if (item.kind === 'grouped_tool_use') {
+    return item.toolUses.flatMap((tool) => typeof tool.toolUseId === 'string' ? [tool.toolUseId] : [])
+  }
+
+  if (item.kind === 'collapsed_tool_batch') {
+    return item.items.flatMap((child) => getDisplayItemToolUseIds(child))
+  }
+
+  return item.fragments.flatMap((fragment) => fragment.type === 'tool_use' && typeof fragment.toolUseId === 'string' ? [fragment.toolUseId] : [])
+}
+
+function shouldAttachOverlayToItem(
+  item: AssistantDisplayItem | GroupedToolUseDisplayItem | CollapsedToolBatchDisplayItem,
+  overlay: TimelineLivePreviewItem,
+): boolean {
+  if (overlay.anchor.parentToolUseId) {
+    return getDisplayItemToolUseIds(item).includes(overlay.anchor.parentToolUseId)
+  }
+
+  if (overlay.anchor.messageId) {
+    return getTranscriptMessageId(item.anchorMessage) === overlay.anchor.messageId
+  }
+
+  return false
+}
+
+function getOverlayHostPriority(
+  item: AssistantDisplayItem | GroupedToolUseDisplayItem | CollapsedToolBatchDisplayItem,
+  overlay: TimelineLivePreviewItem,
+): number {
+  if (!shouldAttachOverlayToItem(item, overlay)) return -1
+  if (overlay.anchor.parentToolUseId) {
+    if (item.kind === 'grouped_tool_use') return 3
+    if (item.kind === 'collapsed_tool_batch') return 2
+    return 1
+  }
+  if (overlay.anchor.messageId) {
+    if (item.kind === 'assistant') return 3
+    if (item.kind === 'grouped_tool_use') return 2
+    if (item.kind === 'collapsed_tool_batch') return 1
+  }
+  return 0
+}
+
+function attachOverlaysToDisplayItems(
+  items: DisplayItem[],
+  overlays: TimelineLivePreviewItem[],
+): { items: DisplayItem[]; unattachedOverlays: TimelineLivePreviewItem[] } {
+  const overlaysByItemId = new Map<string, TimelineLivePreviewItem[]>()
+  const attachedOverlayIds = new Set<string>()
+  const hosts = items.filter(isOverlayHostItem)
+
+  for (const overlay of overlays) {
+    const host = hosts
+      .map((item) => ({ item, priority: getOverlayHostPriority(item, overlay) }))
+      .filter((entry) => entry.priority >= 0)
+      .sort((left, right) => right.priority - left.priority)[0]?.item
+    if (!host) continue
+    overlaysByItemId.set(host.id, [...(overlaysByItemId.get(host.id) || []), overlay])
+    attachedOverlayIds.add(overlay.id)
+  }
+
+  return {
+    items: items.map((item) => {
+      const overlaysForItem = overlaysByItemId.get(item.id)
+      if (!overlaysForItem || !isOverlayHostItem(item)) return item
+      return {
+        ...item,
+        overlays: overlaysForItem,
+      }
+    }),
+    unattachedOverlays: overlays.filter((overlay) => !attachedOverlayIds.has(overlay.id)),
+  }
+}
+
 export const useSessionStore = defineStore('session', () => {
   const historyMessages = ref<HistoryMessage[]>([])
   const historyMessagesHasMore = ref(false)
@@ -306,74 +254,81 @@ export const useSessionStore = defineStore('session', () => {
   const activeRunId = ref<string | null>(null)
   const pendingInteraction = ref<PendingInteraction | null>(null)
   const eventLog = ref<Array<Extract<SessionEvent, { type: 'session.sdk.message' }>>>([])
+  const livePreviewEntries = ref<LivePreviewMapEntry[]>([])
 
   const isLoading = computed(() => ['queued', 'running', 'requires_action'].includes(runState.value))
   const hasAuthToken = computed(() => authToken.value.trim().length > 0)
   const isAwaitingApproval = computed(() => pendingInteraction.value?.kind === 'permission' && pendingInteraction.value?.status === 'pending')
   const isAwaitingInteraction = computed(() => pendingInteraction.value?.status === 'pending')
   const hasActiveRun = computed(() => awaitingRunStart || activeRunId.value !== null)
-  const sdkEvents = computed(() => eventLog.value)
-  const telemetry = computed(() => eventLog.value.filter((event) => !isBusinessSdkMessage(event.payload)))
   const observabilityEvents = computed(() => eventLog.value.filter((event) => {
     if (getSdkMessageLayer(event.payload) !== 'debug-observability') return false
     return !(event.payload?.type === 'system' && event.payload?.subtype === 'init')
   }))
-  const runStateEvents = computed<RunStateSdkEventItem[]>(() =>
-    eventLog.value
-      .filter((event) => isRunStateSdkMessage(event.payload))
-      .map((event, index) => ({
-        kind: 'run-state-event',
-        key: `run-state-${event.sequence}-${index}`,
-        event,
-        layer: getSdkMessageLayer(event.payload),
-        timestamp: typeof event.receivedAt === 'number' ? event.receivedAt : Date.now(),
-      }))
+  const historyAtoms = computed<TranscriptAtom[]>(() =>
+    historyMessages.value.map((message, index) => buildTranscriptAtom(message, {
+      source: 'history',
+      sourceIndex: index,
+      timestamp: message.timestamp,
+      optimistic: Boolean(message.optimistic),
+      ...(message.localId ? { localId: message.localId } : {}),
+    }))
   )
-  const liveSdkTimeline = computed<SdkTimelineItem[]>(() =>
+  const liveAtoms = computed<TranscriptAtom[]>(() =>
     eventLog.value
       .filter((event) => isBusinessSdkMessage(event.payload))
-      .map((event, index) => ({
-        kind: 'sdk-message',
-        key: `${event.sequence}-${index}`,
-        event,
-        timestamp: typeof event.receivedAt === 'number' ? event.receivedAt : Date.now(),
+      .map((event, index) => {
+        const message = getTimelineMessageFromEvent(event)
+        if (!message) return null
+        return buildTranscriptAtom(message, {
+          source: 'live',
+          sourceIndex: index,
+          timestamp: typeof event.receivedAt === 'number' ? event.receivedAt : message.timestamp,
+          sequence: event.sequence,
+        })
+      })
+      .filter((atom): atom is TranscriptAtom => atom !== null && !atom.meta.isMeta)
+  )
+  const defaultTimelineItems = computed<DisplayItem[]>(() =>
+    buildDisplayItems([...historyAtoms.value, ...liveAtoms.value], { mode: 'default' })
+  )
+  const livePreviewItems = computed<TimelineLivePreviewItem[]>(() =>
+    livePreviewEntries.value
+      .filter(({ preview }) => preview.active && preview.blocks.length > 0)
+      .slice()
+      .sort((left, right) => {
+        const leftTimestamp = left.preview.receivedAt ?? 0
+        const rightTimestamp = right.preview.receivedAt ?? 0
+        if (leftTimestamp !== rightTimestamp) return leftTimestamp - rightTimestamp
+        return (left.preview.sequence ?? 0) - (right.preview.sequence ?? 0)
+      })
+      .map(({ preview }) => ({
+        kind: 'live_preview',
+        layer: 'overlay',
+        overlayKind: getLivePreviewOverlayKind(preview),
+        anchor: {
+          scopeKey: preview.scopeKey || 'unknown',
+          ...(preview.messageId ? { messageId: preview.messageId } : {}),
+          ...(preview.parentToolUseId !== undefined ? { parentToolUseId: preview.parentToolUseId } : {}),
+        },
+        id: `live-preview-${preview.scopeKey || 'unknown'}`,
+        key: `live-preview-${preview.scopeKey || 'unknown'}`,
+        timestamp: preview.receivedAt ?? Date.now(),
+        preview,
       }))
   )
-  const historyTimeline = computed<HistoryTimelineItem[]>(() =>
-    buildHistoryTimeline(historyMessages.value)
-  )
-  const timeline = computed<TimelineItem[]>(() => {
-    const items = [...historyTimeline.value, ...liveSdkTimeline.value]
-    return items.sort((left, right) => {
-      if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
+  const timeline = computed<TimelineRenderableItem[]>(() => {
+    const { items: itemsWithOverlays, unattachedOverlays } = attachOverlaysToDisplayItems(
+      defaultTimelineItems.value,
+      livePreviewItems.value,
+    )
 
-      if (left.kind === 'sdk-message' && right.kind === 'sdk-message') {
-        return left.event.sequence - right.event.sequence
-      }
-
-      if (left.kind !== 'sdk-message' && right.kind !== 'sdk-message') {
-        return left.timestamp - right.timestamp || left.key.localeCompare(right.key)
-      }
-
-      const leftRole = left.kind === 'sdk-message'
-        ? getTimelineMessageFromEvent(left.event)?.role
-        : left.kind === 'history-message'
-          ? left.message.role
-          : 'assistant'
-      const rightRole = right.kind === 'sdk-message'
-        ? getTimelineMessageFromEvent(right.event)?.role
-        : right.kind === 'history-message'
-          ? right.message.role
-          : 'assistant'
-
-      if (leftRole === rightRole) {
-        return left.kind === 'sdk-message' ? 1 : -1
-      }
-
-      if (leftRole === 'user') return -1
-      if (rightRole === 'user') return 1
-      return left.kind === 'history-message' ? -1 : 1
-    })
+    return [...itemsWithOverlays, ...unattachedOverlays]
+      .slice()
+      .sort((left, right) => {
+        if (left.timestamp !== right.timestamp) return left.timestamp - right.timestamp
+        return left.key.localeCompare(right.key)
+      })
   })
 
   let ws: WebSocket | null = null
@@ -403,6 +358,7 @@ export const useSessionStore = defineStore('session', () => {
     activeRunId.value = null
     awaitingRunStart = false
     pendingInteraction.value = null
+    livePreviewEntries.value = []
     runState.value = nextState
   }
 
@@ -459,27 +415,68 @@ export const useSessionStore = defineStore('session', () => {
   }
 
   function applySdkMessage(event: Extract<SessionEvent, { type: 'session.sdk.message' }>) {
+    const clientReceivedAt = Date.now()
     const parsedMessage = getTimelineMessageFromEvent(event)
-    const eventTimestamp = typeof event.receivedAt === 'number' ? event.receivedAt : Date.now()
+    let timelineReceivedAt = clientReceivedAt
 
     if (parsedMessage?.role === 'user') {
+      let matchedOptimisticTimestamp: number | null = null
       let removedOptimistic = false
       historyMessages.value = historyMessages.value.filter((message) => {
         if (removedOptimistic) return true
-        if (!isMatchingOptimisticUserMessage(message, parsedMessage, eventTimestamp)) return true
+        if (!isMatchingOptimisticUserMessage(message, parsedMessage, clientReceivedAt)) return true
         removedOptimistic = true
+        matchedOptimisticTimestamp = typeof message.timestamp === 'number' ? message.timestamp : null
         return false
       })
+      if (matchedOptimisticTimestamp !== null) {
+        timelineReceivedAt = matchedOptimisticTimestamp
+      }
     }
 
-    eventLog.value = [...eventLog.value.slice(-199), event]
-    syncSessionId(event.sessionId)
+    const timelineEvent: Extract<SessionEvent, { type: 'session.sdk.message' }> = {
+      ...event,
+      receivedAt: timelineReceivedAt,
+      ...(event.livePreview
+        ? {
+            livePreview: {
+              ...event.livePreview,
+              receivedAt: clientReceivedAt,
+            },
+          }
+        : {}),
+    }
+    const layer = getSdkMessageLayer(timelineEvent.payload)
+
+    if (timelineEvent.livePreview) {
+      livePreviewEntries.value = pruneLivePreviewEntries(upsertLivePreviewEntry(livePreviewEntries.value, timelineEvent.livePreview))
+    }
+
+    if (layer === 'run-state') {
+      syncSessionId(timelineEvent.sessionId)
+      return
+    }
+
+    if (layer === 'live-preview') {
+      syncSessionId(timelineEvent.sessionId)
+      eventLog.value = [...eventLog.value.slice(-199), timelineEvent]
+      return
+    }
+
+    eventLog.value = [...eventLog.value.slice(-199), timelineEvent]
+    if (layer === 'business-message') {
+      livePreviewEntries.value = clearLivePreviewEntriesForMessage(livePreviewEntries.value, parsedMessage)
+      if ((timelineEvent.payload.type === 'assistant' || timelineEvent.payload.type === 'user') && timelineEvent.livePreview) {
+        livePreviewEntries.value = clearLivePreviewEntryByScope(livePreviewEntries.value, timelineEvent.livePreview)
+      }
+    }
+    syncSessionId(timelineEvent.sessionId)
     if (eventLog.value.length === 1 || eventLog.value.length % EVENT_LOG_INTERVAL === 0) {
       logger.debug('chat:sdk-message', {
         count: eventLog.value.length,
-        payloadType: event.payload?.type,
-        sequence: event.sequence,
-        sessionId: shortId(event.sessionId),
+        payloadType: timelineEvent.payload?.type,
+        sequence: timelineEvent.sequence,
+        sessionId: shortId(timelineEvent.sessionId),
       })
     }
   }
@@ -532,6 +529,7 @@ export const useSessionStore = defineStore('session', () => {
 
       case 'session.run.completed':
         pendingInteraction.value = null
+        livePreviewEntries.value = []
         runState.value = 'completed'
         activeRunId.value = null
         awaitingRunStart = false
@@ -807,6 +805,7 @@ export const useSessionStore = defineStore('session', () => {
     historyMessagesLoadingOlder.value = false
     historyMessagesBeforeCursor.value = null
     eventLog.value = []
+    livePreviewEntries.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -823,6 +822,7 @@ export const useSessionStore = defineStore('session', () => {
     historyMessagesLoadingOlder.value = false
     historyMessagesBeforeCursor.value = null
     eventLog.value = []
+    livePreviewEntries.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -865,8 +865,9 @@ export const useSessionStore = defineStore('session', () => {
         historyMessages.value = messages
         eventLog.value = eventLog.value.filter((event) => {
           if (!event.sessionId || event.sessionId !== id) return true
-          return !isBusinessSdkMessage(event.payload)
+          return !isBusinessSdkMessage(event.payload) && !isLivePreviewSdkMessage(event.payload)
         })
+        livePreviewEntries.value = []
       }
       historyMessagesHasMore.value = Boolean(data.hasMore)
       historyMessagesBeforeCursor.value = typeof data.nextBefore === 'string' && data.nextBefore ? data.nextBefore : null
@@ -904,7 +905,7 @@ export const useSessionStore = defineStore('session', () => {
     })
   }
 
-  function respondToPermission(decision: 'approve' | 'deny') {
+  function respondToPermission(decision: 'approve' | 'deny', selectedSuggestion?: PermissionSuggestion | null) {
     if (!ws || ws.readyState !== WebSocket.OPEN || !pendingInteraction.value || pendingInteraction.value.kind !== 'permission' || !activeRunId.value) {
       logger.warn('chat:permission:blocked', {
         hasSocket: Boolean(ws && ws.readyState === WebSocket.OPEN),
@@ -916,6 +917,7 @@ export const useSessionStore = defineStore('session', () => {
 
     logger.info('chat:permission:respond', {
       decision,
+      selectedAction: selectedSuggestion?.action,
       interactionId: shortId(pendingInteraction.value.id),
       runId: shortId(activeRunId.value),
     })
@@ -925,6 +927,7 @@ export const useSessionStore = defineStore('session', () => {
         runId: activeRunId.value,
         permissionId: pendingInteraction.value.id,
         decision,
+        ...(selectedSuggestion !== undefined ? { selectedSuggestion } : {}),
       })
     )
   }
@@ -1004,6 +1007,7 @@ export const useSessionStore = defineStore('session', () => {
     historyMessagesBeforeCursor.value = null
     sessions.value = []
     eventLog.value = []
+    livePreviewEntries.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
@@ -1012,6 +1016,10 @@ export const useSessionStore = defineStore('session', () => {
   return {
     timeline,
     historyMessages,
+    historyAtoms,
+    liveAtoms,
+    livePreviewEntries,
+    livePreviewItems,
     historyMessagesHasMore,
     historyMessagesLoading,
     historyMessagesLoadingOlder,
@@ -1029,10 +1037,7 @@ export const useSessionStore = defineStore('session', () => {
     hasActiveRun,
     activeRunId,
     pendingInteraction,
-    sdkEvents,
-    telemetry,
     observabilityEvents,
-    runStateEvents,
     eventLog,
     isAwaitingApproval,
     isAwaitingInteraction,

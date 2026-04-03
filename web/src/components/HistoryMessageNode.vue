@@ -2,13 +2,19 @@
 import { computed } from 'vue'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
-import type { HistorySingleMessageTimelineItem, SessionMessage, SessionMessageBlock } from '../stores/session'
+import type { SessionMessage, SessionMessageBlock } from '../stores/session'
 import { stringifyStructuredValue } from '../../../shared/transcript-normalizer.js'
+
+interface HistoryMessageNodeItem {
+  key: string
+  timestamp: number
+  message: SessionMessage
+}
 
 defineOptions({ name: 'HistoryMessageNode' })
 
 const props = defineProps<{
-  item: HistorySingleMessageTimelineItem
+  item: HistoryMessageNodeItem
 }>()
 
 const message = computed(() => props.item.message)

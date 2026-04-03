@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import type { UpgradeWebSocket } from 'hono/ws'
-import type { SessionEvent } from '../shared/message-types.js'
+import type { SessionEvent, PermissionSuggestion } from '../shared/message-types.js'
 import type { ElicitationAction, PermissionDecision, RunCoordinator } from './run-coordinator.js'
 import { appendSessionChannelLog } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
@@ -50,8 +50,15 @@ async function appendWebChannelLog(params: {
   }, params.runId)
 }
 
-function handlePermission(ws: any, coordinator: RunCoordinator, runId: string, permissionId: string, decision: PermissionDecision) {
-  const ok = coordinator.respondToPermission(runId, permissionId, decision)
+function handlePermission(
+  ws: any,
+  coordinator: RunCoordinator,
+  runId: string,
+  permissionId: string,
+  decision: PermissionDecision,
+  selectedSuggestion?: PermissionSuggestion | null,
+) {
+  const ok = coordinator.respondToPermission(runId, permissionId, decision, selectedSuggestion)
   if (!ok) {
     sendSessionEvent(ws, { type: 'session.error', runId, error: 'No matching active run for permission response' })
     return
@@ -148,9 +155,17 @@ export function createWebSocketHandler(upgradeWebSocket: UpgradeWebSocket, coord
               payload: {
                 permissionId: data.permissionId,
                 decision: data.decision,
+                ...(data.selectedSuggestion !== undefined ? { selectedSuggestion: data.selectedSuggestion } : {}),
               },
             })
-            handlePermission(ws, coordinator, data.runId, data.permissionId, data.decision)
+            handlePermission(
+              ws,
+              coordinator,
+              data.runId,
+              data.permissionId,
+              data.decision,
+              data.selectedSuggestion as PermissionSuggestion | null | undefined,
+            )
             return
           }
 
