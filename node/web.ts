@@ -11,7 +11,7 @@ import { createLarkOutboundMessage, deliverLarkSessionEvent, invokeLarkCardActio
 import { CONFIG } from './config.js'
 import { RunCoordinator } from './run-coordinator.js'
 import type { StaticMetadataSnapshot, StaticMetadataTreeNode } from '../shared/message-types.js'
-import { listAllSessions, getMessages } from './sessions.js'
+import { listAllSessions, getMessagesPage } from './sessions.js'
 import { appendSessionChannelLog, readSessionChannelLogs, readSessionPersistentLogs, readSessionRuntimeLogs, readSessionTransportLogs } from './transport-logs.js'
 import { createLogger, shortId } from './logger.js'
 import { buildSdkExportTree, mapTree, overlayNodeValues } from './sdk-type-tree.js'
@@ -542,24 +542,29 @@ export function createWebRoutes(upgradeWebSocket: UpgradeWebSocket) {
     try {
       const id = c.req.param('id')
       const limit = parseInt(c.req.query('limit') || '50', 10)
+      const before = c.req.query('before') || null
       logger.info('http:messages:start', {
         sessionId: shortId(id),
         limit,
+        before: before ? shortId(before) : null,
       })
-      const messages = await getMessages(id, limit)
+      const page = await getMessagesPage(id, { limit, before })
       logger.info('http:messages:success', {
         sessionId: shortId(id),
         limit,
-        count: messages.length,
+        before: before ? shortId(before) : null,
+        count: page.messages.length,
+        hasMore: page.hasMore,
+        nextBefore: page.nextBefore ? shortId(page.nextBefore) : null,
         durationMs: Date.now() - startedAt,
       })
-      return c.json({ messages })
+      return c.json(page)
     } catch (err) {
       logger.error('http:messages:error', {
         error: err instanceof Error ? err.message : String(err),
         durationMs: Date.now() - startedAt,
       })
-      return c.json({ messages: [], error: String(err) })
+      return c.json({ messages: [], hasMore: false, nextBefore: null, error: String(err) })
     }
   })
 

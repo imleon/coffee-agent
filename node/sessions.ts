@@ -6,11 +6,18 @@ import type { SDKSessionInfo, SessionMessage as SDKSessionMessage } from '@anthr
 import type { SessionMessage, SessionSummary } from '../shared/message-types.js'
 import {
   extractTimestamp,
+  normalizeStoredTranscriptMessage,
   normalizeTranscriptMessage,
 } from '../shared/transcript-normalizer.js'
 
 export type SessionInfo = SessionSummary
 export type StoredSessionMessage = SessionMessage
+
+export interface SessionMessagePage {
+  messages: SessionMessage[]
+  hasMore: boolean
+  nextBefore: string | null
+}
 
 type TranscriptMessageRecord = {
   uuid?: string
@@ -96,6 +103,79 @@ function toSessionMessage(message: SDKSessionMessage, parentUuid?: string | null
   )
 }
 
+function getMessageUuid(message: SessionMessage): string | null {
+  const raw = message.raw
+  if (!raw || typeof raw !== 'object') return null
+  return typeof (raw as Record<string, unknown>).uuid === 'string' ? (raw as Record<string, unknown>).uuid as string : null
+}
+
+function normalizeLimit(limit: number): number {
+  if (!Number.isFinite(limit)) return 50
+  const normalized = Math.trunc(limit)
+  if (normalized <= 0) return 50
+  return Math.min(normalized, 200)
+}
+
+function normalizeBefore(before: string | null | undefined): string | null {
+  return typeof before === 'string' && before.trim() ? before.trim() : null
+}
+
+function getBeforeOffset(messages: SessionMessage[], before: string | null): number {
+  if (!before) return messages.length
+  const index = messages.findIndex((message) => getMessageUuid(message) === before)
+  return index >= 0 ? index : messages.length
+}
+
+async function readAllMessages(sessionId: string): Promise<SessionMessage[]> {
+  const sdk = await import('@anthropic-ai/claude-agent-sdk')
+  if (typeof sdk.getSessionMessages !== 'function') {
+    console.warn('[Sessions] getSessionMessages not available in SDK, returning empty')
+    return []
+  }
+
+  const [messages, parentByUuid] = await Promise.all([
+    sdk.getSessionMessages(sessionId, {
+      dir: CONFIG.workspacePath,
+      limit: 10_000_000,
+      offset: 0,
+    }),
+    readTranscriptParentMap(sessionId),
+  ])
+
+  return messages.map((message) => toSessionMessage(message, parentByUuid.get(message.uuid)))
+}
+
+export async function getMessagesPage(sessionId: string, options: { limit?: number; before?: string | null } = {}): Promise<SessionMessagePage> {
+  try {
+    const limit = normalizeLimit(options.limit ?? 50)
+    const before = normalizeBefore(options.before)
+    const allMessages = (await readAllMessages(sessionId)).map((message) => normalizeStoredTranscriptMessage(message))
+    const endExclusive = getBeforeOffset(allMessages, before)
+    const start = Math.max(0, endExclusive - limit)
+    const messages = allMessages.slice(start, endExclusive)
+    const hasMore = start > 0
+    const nextBefore = hasMore ? getMessageUuid(allMessages[start]) : null
+
+    return {
+      messages,
+      hasMore,
+      nextBefore,
+    }
+  } catch (e) {
+    console.error('[Sessions] Failed to get messages page:', e)
+    return {
+      messages: [],
+      hasMore: false,
+      nextBefore: null,
+    }
+  }
+}
+
+export async function getMessages(sessionId: string, limit: number = 50): Promise<SessionMessage[]> {
+  const page = await getMessagesPage(sessionId, { limit })
+  return page.messages
+}
+
 export async function listAllSessions(): Promise<SessionInfo[]> {
   try {
     const sdk = await import('@anthropic-ai/claude-agent-sdk')
@@ -107,27 +187,6 @@ export async function listAllSessions(): Promise<SessionInfo[]> {
     return []
   } catch (e) {
     console.error('[Sessions] Failed to list sessions:', e)
-    return []
-  }
-}
-
-export async function getMessages(sessionId: string, limit: number = 50): Promise<SessionMessage[]> {
-  try {
-    const sdk = await import('@anthropic-ai/claude-agent-sdk')
-    if (typeof sdk.getSessionMessages === 'function') {
-      const [messages, parentByUuid] = await Promise.all([
-        sdk.getSessionMessages(sessionId, {
-          dir: CONFIG.workspacePath,
-          limit,
-        }),
-        readTranscriptParentMap(sessionId),
-      ])
-      return messages.map((message) => toSessionMessage(message, parentByUuid.get(message.uuid)))
-    }
-    console.warn('[Sessions] getSessionMessages not available in SDK, returning empty')
-    return []
-  } catch (e) {
-    console.error('[Sessions] Failed to get messages:', e)
     return []
   }
 }

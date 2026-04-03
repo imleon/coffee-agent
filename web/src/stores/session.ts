@@ -91,6 +91,12 @@ interface TransportLogsResponse {
   nextCursor?: number | null
 }
 
+interface SessionMessagesResponse {
+  messages?: unknown[]
+  hasMore?: boolean
+  nextBefore?: string | null
+}
+
 const AUTH_TOKEN_STORAGE_KEY = 'cotta-auth-token'
 const logger = createDebugLogger('session-store')
 const EVENT_LOG_INTERVAL = 20
@@ -285,6 +291,10 @@ function isMatchingOptimisticUserMessage(message: HistoryMessage, candidate: Ses
 
 export const useSessionStore = defineStore('session', () => {
   const historyMessages = ref<HistoryMessage[]>([])
+  const historyMessagesHasMore = ref(false)
+  const historyMessagesLoading = ref(false)
+  const historyMessagesLoadingOlder = ref(false)
+  const historyMessagesBeforeCursor = ref<string | null>(null)
   const sessions = ref<SessionSummary[]>([])
   const currentSessionId = ref<string | null>(null)
   const isConnected = ref(false)
@@ -534,7 +544,7 @@ export const useSessionStore = defineStore('session', () => {
         })
         fetchSessions()
         if (event.sessionId && currentSessionId.value === event.sessionId) {
-          loadSessionMessages(event.sessionId)
+          loadSessionMessages(event.sessionId, { reset: true })
         }
         break
 
@@ -792,6 +802,10 @@ export const useSessionStore = defineStore('session', () => {
     logger.info('chat:new')
     currentSessionId.value = null
     historyMessages.value = []
+    historyMessagesHasMore.value = false
+    historyMessagesLoading.value = false
+    historyMessagesLoadingOlder.value = false
+    historyMessagesBeforeCursor.value = null
     eventLog.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
@@ -804,42 +818,90 @@ export const useSessionStore = defineStore('session', () => {
     })
     currentSessionId.value = id
     historyMessages.value = []
+    historyMessagesHasMore.value = false
+    historyMessagesLoading.value = false
+    historyMessagesLoadingOlder.value = false
+    historyMessagesBeforeCursor.value = null
     eventLog.value = []
     observedEventCount = 0
     optimisticMessageCount = 0
     clearRunState('idle')
-    loadSessionMessages(id)
+    loadSessionMessages(id, { reset: true })
   }
 
-  async function loadSessionMessages(id: string) {
+  async function loadSessionMessages(
+    id: string,
+    options: { reset?: boolean; prepend?: boolean; before?: string | null } = {},
+  ) {
+    if (!id || historyMessagesLoading.value) return false
+
+    historyMessagesLoading.value = true
+    historyMessagesLoadingOlder.value = Boolean(options.prepend)
     logger.info('messages:load:start', {
       sessionId: shortId(id),
+      reset: Boolean(options.reset),
+      prepend: Boolean(options.prepend),
+      before: options.before ? shortId(options.before) : null,
     })
     try {
-      const res = await apiFetch(`/api/sessions/${id}/messages`)
+      const params = new URLSearchParams()
+      params.set('limit', '50')
+      if (options.before) params.set('before', options.before)
+      const res = await apiFetch(`/api/sessions/${id}/messages?${params.toString()}`)
       if (!res.ok) {
         logger.warn('messages:load:error', {
           sessionId: shortId(id),
           status: res.status,
+          reset: Boolean(options.reset),
+          prepend: Boolean(options.prepend),
         })
-        return
+        return false
       }
-      const data = await res.json()
-      historyMessages.value = (data.messages || []).map((m: unknown) => normalizeStoredTranscriptMessage(m))
-      eventLog.value = eventLog.value.filter((event) => {
-        if (!event.sessionId || event.sessionId !== id) return true
-        return !isBusinessSdkMessage(event.payload)
-      })
+      const data = await res.json() as SessionMessagesResponse
+      const messages = (data.messages || []).map((m: unknown) => normalizeStoredTranscriptMessage(m))
+      if (options.prepend) {
+        historyMessages.value = [...messages, ...historyMessages.value]
+      } else {
+        historyMessages.value = messages
+        eventLog.value = eventLog.value.filter((event) => {
+          if (!event.sessionId || event.sessionId !== id) return true
+          return !isBusinessSdkMessage(event.payload)
+        })
+      }
+      historyMessagesHasMore.value = Boolean(data.hasMore)
+      historyMessagesBeforeCursor.value = typeof data.nextBefore === 'string' && data.nextBefore ? data.nextBefore : null
       logger.info('messages:load:success', {
         sessionId: shortId(id),
-        count: historyMessages.value.length,
+        count: messages.length,
+        total: historyMessages.value.length,
+        hasMore: historyMessagesHasMore.value,
+        nextBefore: historyMessagesBeforeCursor.value ? shortId(historyMessagesBeforeCursor.value) : null,
+        reset: Boolean(options.reset),
+        prepend: Boolean(options.prepend),
       })
+      return true
     } catch (error) {
       logger.error('messages:load:error', {
         sessionId: shortId(id),
         error: error instanceof Error ? error.message : String(error),
+        reset: Boolean(options.reset),
+        prepend: Boolean(options.prepend),
       })
+      return false
+    } finally {
+      historyMessagesLoading.value = false
+      historyMessagesLoadingOlder.value = false
     }
+  }
+
+  async function loadOlderSessionMessages() {
+    if (!currentSessionId.value || !historyMessagesHasMore.value || historyMessagesLoading.value || !historyMessagesBeforeCursor.value) {
+      return false
+    }
+    return loadSessionMessages(currentSessionId.value, {
+      prepend: true,
+      before: historyMessagesBeforeCursor.value,
+    })
   }
 
   function respondToPermission(decision: 'approve' | 'deny') {
@@ -936,6 +998,10 @@ export const useSessionStore = defineStore('session', () => {
     authError.value = ''
     currentSessionId.value = null
     historyMessages.value = []
+    historyMessagesHasMore.value = false
+    historyMessagesLoading.value = false
+    historyMessagesLoadingOlder.value = false
+    historyMessagesBeforeCursor.value = null
     sessions.value = []
     eventLog.value = []
     observedEventCount = 0
@@ -946,6 +1012,10 @@ export const useSessionStore = defineStore('session', () => {
   return {
     timeline,
     historyMessages,
+    historyMessagesHasMore,
+    historyMessagesLoading,
+    historyMessagesLoadingOlder,
+    historyMessagesBeforeCursor,
     sessions,
     currentSessionId,
     isConnected,
@@ -973,6 +1043,7 @@ export const useSessionStore = defineStore('session', () => {
     fetchSessions,
     newChat,
     selectSession,
+    loadOlderSessionMessages,
     initialize,
     setAuthToken,
     clearAuthToken,

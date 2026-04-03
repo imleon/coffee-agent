@@ -17,6 +17,8 @@ import {
 const session = useSessionStore()
 const container = ref<HTMLElement>()
 const elicitationInput = ref('')
+const preservingOlderScroll = ref(false)
+const initialHistoryAutoScrollPending = ref(true)
 const runStateItems = computed(() => session.runStateEvents.slice().reverse())
 const observabilityItems = computed(() => session.observabilityEvents.slice().reverse())
 const timelineItems = computed(() => session.timeline)
@@ -352,6 +354,42 @@ function isRedactedThinkingMessage(message: SessionMessage): boolean {
   return Boolean(content && typeof content === 'object' && (content as Record<string, unknown>).type === 'redacted_thinking')
 }
 
+function isNearBottom(): boolean {
+  const el = container.value
+  if (!el) return true
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= 120
+}
+
+async function scrollToBottom() {
+  await nextTick()
+  if (!container.value) return
+  container.value.scrollTop = container.value.scrollHeight
+}
+
+async function maybeLoadOlderHistory() {
+  const el = container.value
+  if (!el || el.scrollTop > 120) return
+  if (!session.historyMessagesHasMore || session.historyMessagesLoading) return
+
+  preservingOlderScroll.value = true
+  const previousHeight = el.scrollHeight
+  const previousTop = el.scrollTop
+  const loaded = await session.loadOlderSessionMessages()
+  if (!loaded) {
+    preservingOlderScroll.value = false
+    return
+  }
+
+  await nextTick()
+  const nextHeight = el.scrollHeight
+  el.scrollTop = nextHeight - previousHeight + previousTop
+  preservingOlderScroll.value = false
+}
+
+function handleScroll() {
+  void maybeLoadOlderHistory()
+}
+
 function submitElicitation() {
   if (session.pendingInteraction?.kind !== 'elicitation') return
 
@@ -385,14 +423,31 @@ function submitElicitation() {
 }
 
 watch(
-  () => [session.timeline.length, session.runStateEvents.length, session.observabilityEvents.length, session.pendingInteraction?.id],
-  async () => {
-    await nextTick()
-    if (container.value) {
-      container.value.scrollTop = container.value.scrollHeight
-    }
+  () => session.currentSessionId,
+  () => {
+    initialHistoryAutoScrollPending.value = true
   },
-  { deep: true }
+)
+
+watch(
+  () => session.historyMessages.length,
+  async (next, prev) => {
+    if (next === 0 || next === prev || preservingOlderScroll.value) return
+    if (!initialHistoryAutoScrollPending.value) return
+    if (session.historyMessagesLoadingOlder) return
+    initialHistoryAutoScrollPending.value = false
+    await scrollToBottom()
+  },
+)
+
+watch(
+  () => [session.timeline.length, session.runStateEvents.length, session.observabilityEvents.length, session.pendingInteraction?.id],
+  async (_next, _prev) => {
+    if (preservingOlderScroll.value || session.historyMessagesLoadingOlder) return
+    if (!isNearBottom()) return
+    await scrollToBottom()
+  },
+  { deep: true },
 )
 
 watch(
@@ -404,7 +459,14 @@ watch(
 </script>
 
 <template>
-  <div ref="container" class="flex-1 overflow-y-auto p-6 space-y-4">
+  <div ref="container" class="flex-1 overflow-y-auto p-6 space-y-4" @scroll="handleScroll">
+    <div
+      v-if="session.historyMessagesLoadingOlder"
+      class="flex justify-center text-xs text-gray-400"
+    >
+      正在加载更早消息…
+    </div>
+
     <div
       v-if="session.timeline.length === 0"
       class="flex items-center justify-center h-full text-gray-400"
